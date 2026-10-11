@@ -1,0 +1,154 @@
+# Publishes an SDK when the mirror pushes its version tag. Nothing here runs on branches.
+#
+#   sdk-browser/v<version>     -> npm @auth4/sdk-browser
+#   sdk-server/v<version>      -> npm @auth4/sdk-server
+#   sdk-nextjs/v<version>      -> npm @auth4/nextjs
+#   dev.auth4.sdk/v<version>   -> Unity: checked and packed only. OpenUPM builds from the tag itself
+#                                 (gitTagPrefix "dev.auth4.sdk/"); the Asset Store upload is manual.
+#
+# This repository is the read-only mirror of the SDKs (README.md). Only the mirror's deploy key can
+# update main or create these tags; the source repository's CI has already passed for the commit.
+#
+# Gate (no credentials): the tagged commit is a mirror commit on main, the tag matches package.json
+# and the licence is final (scripts/sdk/check.mjs --release). The tarball checked here is the exact
+# file that is published.
+# Publish: runs in the GitHub environment "npm" (required reviewer, tags sdk-browser/v*,
+# sdk-server/v* and sdk-nextjs/v* only) with id-token: write. npm trusted publishing (OIDC) is the
+# default. Only if the environment has the secret NPM_TOKEN (a short-lived token for the first publish
+# of a package, before trusted publishing can be configured for it) is that token used instead. That
+# token is stage-only, so the version is staged and goes live only after approval on npmjs.com.
+# Every publish carries npm provenance.
+name: Publish SDKs
+
+on:
+  push:
+    tags:
+      - "sdk-browser/v*"
+      - "sdk-server/v*"
+      - "sdk-nextjs/v*"
+      - "dev.auth4.sdk/v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-sdks-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CI: "1"
+  NODE_VERSION: "22.20.0"
+  # Trusted publishing needs npm 11.5.1 or later; Node 22 ships npm 10.
+  NPM_VERSION: "11.21.0"
+
+jobs:
+  gate:
+    name: Check the tagged package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ github.ref_name }}
+      SHA: ${{ github.sha }}
+    outputs:
+      kind: ${{ steps.check.outputs.kind }}
+      name: ${{ steps.check.outputs.name }}
+      version: ${{ steps.check.outputs.version }}
+      tarball: ${{ steps.check.outputs.tarball }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - name: Commit is a mirror commit on main
+        run: |
+          git merge-base --is-ancestor "$SHA" origin/main || { echo "$TAG is not on main" >&2; exit 1; }
+          git log -1 --format=%B "$SHA" | grep -Eq '^Source: Plorax/auth4\.dev@[0-9a-f]{40}$' || {
+            echo "$TAG does not point at a mirror commit" >&2
+            exit 1
+          }
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build, pack and check the release
+        id: check
+        run: node scripts/sdk/check.mjs --release "$TAG"
+      - name: Upload the checked package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sdk-package
+          path: |
+            ${{ steps.check.outputs.tarball }}
+            .generated/auth4d-151/sdk-check.json
+          retention-days: 90
+          if-no-files-found: error
+          include-hidden-files: true
+
+  npm:
+    name: Publish to npm
+    needs: gate
+    if: needs.gate.outputs.kind == 'npm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/${{ needs.gate.outputs.name }}/v/${{ needs.gate.outputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TARBALL: ${{ needs.gate.outputs.tarball }}
+    steps:
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # No pnpm here, and no registry-url: setup-node would write a token placeholder to .npmrc.
+          package-manager-cache: false
+      - name: Install npm ${{ env.NPM_VERSION }}
+        run: npm install --global "npm@${NPM_VERSION}"
+      # No checkout or install here: only the tarball the gate checked reaches this job.
+      - name: Download the checked package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdk-package
+          # The artifact is rooted at the gate's output directory; restore it there so $TARBALL resolves.
+          path: .generated/auth4d-151
+      # npm itself refuses a version that already exists; bump the version and tag again.
+      - name: Publish
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "::notice::Staging with the npm environment secret NPM_TOKEN (bootstrap). Approve the staged version on npmjs.com with 2FA."
+            # Single quotes: .npmrc names the variable, npm reads the value from the environment.
+            printf '%s\n' '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > "$HOME/.npmrc"
+            export NODE_AUTH_TOKEN="$NPM_TOKEN"
+            # The bootstrap token is stage-only: npm refuses npm publish with it. npm stage publish
+            # packs the current directory, so stage the checked tarball's own contents.
+            mkdir "$RUNNER_TEMP/package"
+            tar -xzf "$TARBALL" -C "$RUNNER_TEMP/package"
+            cd "$RUNNER_TEMP/package/package"
+            npm stage publish --provenance --access public
+          else
+            echo "Publishing with npm trusted publishing (OIDC)."
+            npm publish "$TARBALL" --provenance --access public
+          fi
+
+  unity:
+    name: Unity package summary
+    needs: gate
+    if: needs.gate.outputs.kind == 'unity'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NAME: ${{ needs.gate.outputs.name }}
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - name: Next steps
+        run: |
+          {
+            echo "### $NAME@$VERSION checked"
+            echo "OpenUPM builds this version from the tag. The UPM tarball is the sdk-package"
+            echo "artifact of this run; use it for the Asset Store submission."
+          } >> "$GITHUB_STEP_SUMMARY"
