@@ -1,0 +1,24 @@
+{
+  "name": "auth4-sdks",
+  "private": true,
+  "description": "Public mirror of the auth4.dev SDKs. Read-only: changes are made in Plorax/auth4.dev.",
+  "license": "MIT",
+  "packageManager": "pnpm@10.23.0",
+  "engines": {
+    "node": ">=22.19.0 <23",
+    "pnpm": "10.23.0"
+  },
+  "scripts": {
+    "build": "pnpm --recursive --if-present run build",
+    "test": "pnpm --recursive --if-present run test",
+    "typecheck": "tsc --noEmit",
+    "check": "node scripts/sdk/check.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.11"
+  }
+}

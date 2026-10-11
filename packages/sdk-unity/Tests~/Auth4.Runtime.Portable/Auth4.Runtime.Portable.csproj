@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Compiles the engine-independent Runtime sources as .NET Standard 2.1 with C# 9, matching the
+    API surface and language level of Unity 2022.3 LTS and Unity 6 LTS. Runtime/Unity is excluded
+    because it references UnityEngine.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>Auth4</RootNamespace>
+    <AssemblyName>Auth4.Runtime</AssemblyName>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Runtime/**/*.cs" Exclude="../../Runtime/Unity/**" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,5 @@
+# Headless .NET build output
+Tests~/**/bin/
+Tests~/**/obj/
+Tests~/**/TestResults/
+

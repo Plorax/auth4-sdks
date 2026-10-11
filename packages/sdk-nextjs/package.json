@@ -1,0 +1,63 @@
+{
+  "name": "@auth4/nextjs",
+  "version": "0.1.0",
+  "description": "Next.js App Router SDK for auth4.dev: server-side sign-in with PKCE, encrypted session cookies and rotating refresh tokens.",
+  "license": "MIT",
+  "homepage": "https://auth4.dev/docs/nextjs/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Plorax/auth4-sdks.git",
+    "directory": "packages/sdk-nextjs"
+  },
+  "keywords": [
+    "auth4",
+    "authentication",
+    "nextjs",
+    "oauth",
+    "oidc",
+    "pkce",
+    "games"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/server.ts"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/sdk-nextjs/src/index.d.ts",
+        "default": "./dist/sdk-nextjs/src/index.js"
+      },
+      "./server": {
+        "types": "./dist/sdk-nextjs/src/server.d.ts",
+        "default": "./dist/sdk-nextjs/src/server.js"
+      }
+    }
+  },
+  "dependencies": {
+    "jose": "^6.2.12"
+  },
+  "peerDependencies": {
+    "next": "^15.2.0 || ^16.0.0",
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "next": "16.4.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "bugs": {
+    "url": "https://github.com/Plorax/auth4-sdks/issues"
+  }
+}

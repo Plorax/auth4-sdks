@@ -1,0 +1,13 @@
+{
+  "name": "@auth4/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Wire shapes shared by the SDKs; inlined into the packages that import it.",
+  "type": "module",
+  "exports": {
+    "./sdk": "./src/sdk.ts"
+  },
+  "dependencies": {
+    "zod": "4.6.5"
+  }
+}

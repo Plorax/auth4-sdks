@@ -1,0 +1,109 @@
+<!doctype html>
+<!--
+  Minimal Unity WebGL stand-in for AUTH4D-69. It loads the real Auth4Upgrade.jslib through
+  emscripten-shim.js and plays the C# side (Auth4Client with WebGLUpgradeWindow): it answers ready
+  with the guest access token, and records what crosses into "C#". The test serves
+  /harness-config.js with the tenant, client, auth origin and guest token.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>WebGL game</title>
+  </head>
+  <body>
+    <canvas id="unity-canvas" width="480" height="240" aria-label="Game"></canvas>
+    <button id="save" type="button">Save progress</button>
+    <p id="status" role="status"></p>
+    <script src="/harness-config.js"></script>
+    <script src="/emscripten-shim.js"></script>
+    <script type="module">
+      const { authOrigin, tenantId, clientId, guestToken } = window.harnessConfig;
+      const upgradeUrl = `${authOrigin}/login/upgrade?tenant_id=${tenantId}&client_id=${clientId}`;
+      const status = document.getElementById("status");
+      await window.emscripten.loadLibrary("/Auth4Upgrade.jslib");
+
+      window.events = [];
+      window.outcome = null;
+      let handle = 0;
+
+      const finish = (outcome, release) => {
+        window.outcome = outcome;
+        status.textContent = outcome.ok ? "Saved" : `Not saved: ${outcome.code}`;
+        if (release) window._Auth4Upgrade_Release(handle);
+      };
+
+      // The C# [MonoPInvokeCallback] that WebGLUpgradeWindow registers.
+      const callback = window.emscripten.addFunction((id, kindPointer, dataPointer) => {
+        const kind = window.UTF8ToString(kindPointer);
+        const data = window.UTF8ToString(dataPointer);
+        const size = window.lengthBytesUTF8(data) + 1;
+        const event = { handle: id, kind, data, cleared: null };
+        window.events.push(event);
+        // The bridge zeroes the payload as soon as this callback returns.
+        queueMicrotask(() => {
+          event.cleared = window.HEAPU8.subarray(dataPointer, dataPointer + size).every(
+            (b) => b === 0,
+          );
+        });
+        if (id !== handle) return;
+        switch (kind) {
+          case "opened":
+            status.textContent = "Window open";
+            return;
+          case "ready": {
+            const ready = JSON.parse(data);
+            if (ready.tenant_id !== tenantId || ready.client_id !== clientId) return;
+            const token = window.emscripten.allocString(guestToken);
+            window._Auth4Upgrade_SendToken(handle, token.pointer);
+            window.HEAPU8.fill(0, token.pointer, token.pointer + token.size);
+            window._free(token.pointer);
+            return;
+          }
+          case "complete":
+            finish({ ok: true, result: JSON.parse(data) }, true);
+            return;
+          case "error":
+            // After identity_in_use the window may still link another credential.
+            if (data === "identity_in_use") finish({ ok: false, code: data }, false);
+            else if (data === "invalid_session") finish({ ok: false, code: data }, true);
+            return;
+          case "cancelled":
+            finish({ ok: false, code: "access_denied" }, true);
+            return;
+          case "blocked":
+            finish({ ok: false, code: "popup_blocked" }, false);
+            return;
+          case "closed":
+            finish({ ok: false, code: "window_closed" }, false);
+            return;
+          default:
+            return;
+        }
+      });
+
+      /** Auth4Client.UpgradeGuestAsync in a WebGL build: WebGLUpgradeWindow.Open. */
+      window.startUpgrade = (url = upgradeUrl, origin = authOrigin) => {
+        const urlString = window.emscripten.allocString(url);
+        const originString = window.emscripten.allocString(origin);
+        handle += 1;
+        const opened = window._Auth4Upgrade_Open(
+          handle,
+          urlString.pointer,
+          originString.pointer,
+          callback,
+        );
+        window._free(urlString.pointer);
+        window._free(originString.pointer);
+        return opened;
+      };
+      /** The cancellation token fired. */
+      window.cancelUpgrade = () => window._Auth4Upgrade_Close(handle);
+
+      // Unity runs input handlers on the next frame, after the browser event has returned.
+      document.getElementById("save").addEventListener("pointerdown", () => {
+        requestAnimationFrame(() => window.startUpgrade());
+      });
+      window.harnessReady = true;
+    </script>
+  </body>
+</html>

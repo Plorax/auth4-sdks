@@ -1,0 +1,14 @@
+{
+  "name": "Auth4.Samples.DeviceLogin",
+  "rootNamespace": "Auth4.Samples.DeviceLogin",
+  "references": ["Auth4.Runtime", "Auth4.Unity"],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

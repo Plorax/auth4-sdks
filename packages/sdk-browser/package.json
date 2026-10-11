@@ -1,0 +1,45 @@
+{
+  "name": "@auth4/sdk-browser",
+  "version": "0.1.0",
+  "description": "Browser SDK for auth4.dev: authorization code with PKCE, in-memory tokens, guest sessions and upgrades.",
+  "license": "MIT",
+  "homepage": "https://auth4.dev/docs/browser/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Plorax/auth4-sdks.git",
+    "directory": "packages/sdk-browser"
+  },
+  "keywords": [
+    "auth4",
+    "authentication",
+    "oauth",
+    "oidc",
+    "pkce",
+    "games"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/sdk/build.mjs",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/sdk-browser/src/index.d.ts",
+        "default": "./dist/sdk-browser/src/index.js"
+      }
+    }
+  },
+  "bugs": {
+    "url": "https://github.com/Plorax/auth4-sdks/issues"
+  }
+}

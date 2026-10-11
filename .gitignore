@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.generated/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+.npmrc.local
+packages/sdk-unity/Tests~/**/bin/
+packages/sdk-unity/Tests~/**/obj/
+packages/sdk-unity/Tests~/**/TestResults/

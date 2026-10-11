@@ -1,0 +1,14 @@
+{
+  "name": "Auth4.Unity",
+  "rootNamespace": "Auth4.Unity",
+  "references": ["Auth4.Runtime"],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

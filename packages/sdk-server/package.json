@@ -1,0 +1,54 @@
+{
+  "name": "@auth4/sdk-server",
+  "version": "0.1.0",
+  "description": "Server SDK for auth4.dev: verifies tenant access tokens against the tenant's JWKS, with optional introspection.",
+  "license": "MIT",
+  "homepage": "https://auth4.dev/docs/server/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Plorax/auth4-sdks.git",
+    "directory": "packages/sdk-server"
+  },
+  "keywords": [
+    "auth4",
+    "authentication",
+    "jwt",
+    "jwks",
+    "oauth",
+    "games"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/sdk/build.mjs"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/sdk-server/src/index.d.ts",
+        "default": "./dist/sdk-server/src/index.js"
+      }
+    }
+  },
+  "dependencies": {
+    "jose": "^6.2.12",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@auth4/contracts": "workspace:*"
+  },
+  "bugs": {
+    "url": "https://github.com/Plorax/auth4-sdks/issues"
+  }
+}
