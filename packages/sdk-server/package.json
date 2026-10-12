@@ -1,6 +1,6 @@
 {
   "name": "@auth4/sdk-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Server SDK for auth4.dev: verifies tenant access tokens against the tenant's JWKS, with optional introspection.",
   "license": "MIT",
   "homepage": "https://auth4.dev/docs/server/",

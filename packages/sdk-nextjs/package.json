@@ -1,6 +1,6 @@
 {
   "name": "@auth4/nextjs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Next.js App Router SDK for auth4.dev: server-side sign-in with PKCE, encrypted session cookies and rotating refresh tokens.",
   "license": "MIT",
   "homepage": "https://auth4.dev/docs/nextjs/",

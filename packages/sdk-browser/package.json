@@ -1,6 +1,6 @@
 {
   "name": "@auth4/sdk-browser",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Browser SDK for auth4.dev: authorization code with PKCE, in-memory tokens, guest sessions and upgrades.",
   "license": "MIT",
   "homepage": "https://auth4.dev/docs/browser/",
