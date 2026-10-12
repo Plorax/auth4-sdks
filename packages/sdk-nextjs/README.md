@@ -5,6 +5,10 @@ through the hosted login page with the authorization-code flow and PKCE, keeps t
 encrypted `HttpOnly` cookie, and refreshes them on the server. It runs on Node.js, the Edge runtime
 and Cloudflare (OpenNext), using only `jose` and the Web Crypto API.
 
+```sh
+npm install @auth4/nextjs
+```
+
 ```ts
 // lib/auth4.ts: reads AUTH4_ORIGIN, AUTH4_TENANT_ID, AUTH4_CLIENT_ID, APP_BASE_URL, AUTH4_SECRET
 import { Auth4Client } from "@auth4/nextjs/server";

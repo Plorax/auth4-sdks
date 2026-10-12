@@ -33,7 +33,7 @@ its tag.
 
 ## Building and checking locally
 
-Node 22 and pnpm 10 (the version in `package.json`):
+Node 26 and pnpm 10 (the versions in `package.json`):
 
 ```sh
 pnpm install --frozen-lockfile

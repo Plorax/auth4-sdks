@@ -37,8 +37,8 @@ concurrency:
 
 env:
   CI: "1"
-  NODE_VERSION: "22.20.0"
-  # Trusted publishing needs npm 11.5.1 or later; Node 22 ships npm 10.
+  NODE_VERSION: "26.11.1"
+  # Trusted publishing needs npm 11.5.1 or later; pin it rather than use the npm Node ships.
   NPM_VERSION: "11.21.0"
 
 jobs:
