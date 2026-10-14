@@ -184,6 +184,36 @@ export const MetadataClaimSchema = UserClaimMetadataSchema.refine(
   "An empty metadata claim is omitted.",
 );
 
+/**
+ * AUTH4D-258: the `idp` claim names the method used for this sign-in. `email` covers email codes,
+ * magic links and passwords until a sign-in records which of them it was; `password` and
+ * `magic_link` are reserved for that. `session` is a reused hosted-login session with no new
+ * proof. A verified email step never changes it: a Steam sign-in stays `steam`.
+ */
+export const IdpSchema = z.enum([
+  "email",
+  "password",
+  "magic_link",
+  "passkey",
+  "sms",
+  "discord",
+  "steam",
+  "epic",
+  "google",
+  "apple",
+  "microsoft",
+  "oidc",
+  "sso",
+  "guest",
+  "session",
+]);
+export type Idp = z.infer<typeof IdpSchema>;
+/**
+ * Token readers accept any well-formed value, so a method added later does not make older SDKs
+ * refuse the token. Issuers only emit IdpSchema values.
+ */
+export const IdpClaimSchema = z.string().regex(/^[a-z][a-z0-9_]{1,31}$/);
+
 export const TokenAudienceSchema = z.string().min(1).max(255);
 /** Shared by access and ID tokens; index.ts extends it for IdTokenClaimsSchema. */
 export const JwtBaseSchema = z
@@ -210,6 +240,8 @@ export const AccessTokenClaimsSchema = JwtBaseSchema.extend({
   auth4_roles: RolesClaimSchema.optional(),
   /** METADATA_CLAIM (AUTH4D-154): per-user metadata. Absent means none. */
   auth4_meta: MetadataClaimSchema.optional(),
+  /** AUTH4D-258: the sign-in method (IdpSchema). ID tokens and userinfo carry it; absent is fine. */
+  idp: IdpClaimSchema.optional(),
 }).superRefine((claims, ctx) => {
   if (!issuerMatchesTenant(claims.iss, claims.tenant_id)) {
     ctx.addIssue({

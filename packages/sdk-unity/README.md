@@ -5,6 +5,9 @@
 - **Device login** (RFC 8628): show a short code, the player approves it on a phone or PC.
 - **Guest sessions** with a stable user ID, upgraded later by email verification or an enabled
   social provider without losing the player's ID.
+- **Account email**: `AddEmailAsync`, `ChangeEmailAsync` and `RemoveEmailAsync` let a signed-in
+  player, for example one who signed in with Steam or Epic Games, manage a verified email address
+  through the hosted pages.
 - **Rotating refresh tokens** with single-flight refresh, so parallel game requests never replay a
   refresh token.
 

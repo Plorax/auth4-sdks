@@ -1,7 +1,7 @@
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { NextRequest } from "next/server.js";
 import { beforeAll, describe, expect, it } from "vitest";
-import { Auth4Client, ConfigurationError, type Auth4ClientOptions } from "./server.ts";
+import { Auth4Client, ConfigurationError, type Auth4ClientOptions, type User } from "./server.ts";
 
 // AUTH4D-231 unit tests: the middleware routes against a mock auth4.dev issuer that signs real
 // RS256 ID tokens. Every network call goes through the injected fetch.
@@ -636,6 +636,55 @@ describe("AUTH4D-231 profile, access token and cookies", () => {
     const value = browser.jar.get("auth4_session")!.value;
     tampered.jar.set("auth4_session", { value: `${value.slice(0, -4)}AAAA`, path: "/" });
     expect(await auth4.getSession(tampered.request("/"))).toBeNull();
+  });
+});
+
+describe("AUTH4D-270 idp claim", () => {
+  async function userFor(idClaims: Record<string, unknown>) {
+    const { auth4, issuer } = setup();
+    issuer.options.idClaims = idClaims;
+    const browser = new Browser();
+    await signIn(auth4, browser, issuer);
+    return (await auth4.getSession(browser.request("/")))?.user;
+  }
+
+  it("types a Steam sign-in with a verified email and idp", async () => {
+    const user: User | undefined = await userFor({ idp: "steam" });
+    expect(user).toEqual({
+      sub: "usr_player0000000001",
+      email: "player@example.test",
+      email_verified: true,
+      idp: "steam",
+    });
+    const idp: string | undefined = user?.idp;
+    expect(idp).toBe("steam");
+  });
+
+  it("leaves email and idp out when the token has none", async () => {
+    const user = await userFor({ email: undefined, email_verified: undefined });
+    expect(user).toEqual({ sub: "usr_player0000000001" });
+    expect(user?.idp).toBeUndefined();
+  });
+
+  it("accepts an idp this SDK version does not know yet", async () => {
+    expect((await userFor({ idp: "future_method" }))?.idp).toBe("future_method");
+  });
+
+  it.each([
+    ["a malformed idp", { idp: "Steam!" }],
+    ["a non-string idp", { idp: 7 }],
+    ["a non-string email", { email: 7 }],
+    ["a non-boolean email_verified", { email_verified: "true" }],
+  ])("rejects an ID token with %s", async (_label, claims) => {
+    const { auth4, issuer } = setup();
+    issuer.options.idClaims = claims;
+    const browser = new Browser();
+    const { state } = await startLogin(auth4, browser, issuer);
+    const response = await auth4.middleware(
+      browser.request(`/auth/callback?code=c&state=${state}`),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("invalid_id_token");
   });
 });
 

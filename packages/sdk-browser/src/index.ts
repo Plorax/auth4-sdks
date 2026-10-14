@@ -20,8 +20,49 @@ const UPGRADE_MESSAGE = {
 const UPGRADE_WINDOW_NAME = "auth4-guest-upgrade";
 const UPGRADE_WINDOW_FEATURES = "popup,width=480,height=720";
 const UPGRADE_WINDOW_POLL_MS = 500;
-/** Add-email window (AUTH4D-149). The app polls the API; the window never receives a token. */
-const ADD_EMAIL_WINDOW_NAME = "auth4-add-email";
+/**
+ * Add-email window (AUTH4D-149), also used to change or remove the address (AUTH4D-212). The app
+ * polls the API; the window never receives a token. Each action accepts only its own hosted page.
+ */
+const EMAIL_ACTIONS = {
+  add: {
+    path: "/login/add-email",
+    window: "auth4-add-email",
+    failed: "add_email_failed",
+    label: "add-email",
+    doing: "adding an email address",
+    title: "Adding an email address",
+    verb: "add an email address",
+  },
+  change: {
+    path: "/login/change-email",
+    window: "auth4-change-email",
+    failed: "change_email_failed",
+    label: "change-email",
+    doing: "changing the email address",
+    title: "Changing the email address",
+    verb: "change the email address",
+  },
+  remove: {
+    path: "/login/remove-email",
+    window: "auth4-remove-email",
+    failed: "remove_email_failed",
+    label: "remove-email",
+    doing: "removing the email address",
+    title: "Removing the email address",
+    verb: "remove the email address",
+  },
+} as const;
+/** Refusals the intent endpoint can answer with, surfaced under their own codes. */
+const EMAIL_INTENT_REFUSALS = [
+  "guest_account",
+  "email_already_added",
+  "email_sign_in_disabled",
+  "email_not_added",
+  "only_sign_in_method",
+] as const;
+/** AUTH4D-258 IdpClaimSchema: any well-formed method name, so a new method is still accepted. */
+const IDP = /^[a-z][a-z0-9_]{1,31}$/u;
 const ADD_EMAIL_INTENT = /^aei_[A-Za-z0-9_-]{32,64}$/u;
 const ADD_EMAIL_POLL_SECRET = /^aep_[A-Za-z0-9_-]{43,86}$/u;
 const ADD_EMAIL_MIN_INTERVAL_SECONDS = 5;
@@ -91,7 +132,12 @@ export type Auth4BrowserErrorCode =
   | "guest_account"
   | "email_already_added"
   | "email_sign_in_disabled"
-  | "add_email_failed";
+  | "add_email_failed"
+  | "email_not_added"
+  | "only_sign_in_method"
+  | "email_window_open"
+  | "change_email_failed"
+  | "remove_email_failed";
 
 export class Auth4BrowserError extends Error {
   readonly code: Auth4BrowserErrorCode;
@@ -175,6 +221,11 @@ export interface BrowserUser {
   sub: string;
   email?: string;
   email_verified?: boolean;
+  /**
+   * The method used for this sign-in, such as "steam", "discord", "email" or "guest" (AUTH4D-258).
+   * Later releases may add methods, so treat unknown values as valid.
+   */
+  idp?: string;
 }
 
 export interface BrowserSession {
@@ -218,11 +269,31 @@ export interface AddEmailResult {
   identity: { identityId: string; provider: "email" };
 }
 
+/** Options for changeEmail() and removeEmail() (AUTH4D-256). */
+export type ChangeEmailOptions = AddEmailOptions;
+export type RemoveEmailOptions = AddEmailOptions;
+
+export interface ChangeEmailResult {
+  /** The refreshed session for the same user, with the new verified address. */
+  session: BrowserSession;
+  /** The new address the player verified. */
+  email: string;
+  /** The new email identity; the previous one is deleted. */
+  identity: { identityId: string; provider: "email" };
+}
+
+export interface RemoveEmailResult {
+  /** The refreshed session for the same user. It has no email address. */
+  session: BrowserSession;
+}
+
 /** Session lifecycle events. They never carry token values. */
 export type BrowserSessionEvent =
   | { type: "renewed"; session: BrowserSession }
   | { type: "upgraded"; session: BrowserSession }
   | { type: "email_added"; session: BrowserSession }
+  | { type: "email_changed"; session: BrowserSession }
+  | { type: "email_removed"; session: BrowserSession }
   | { type: "signed_out"; reason: "logout" | "refresh_rejected" };
 
 export type BrowserSessionListener = (event: BrowserSessionEvent) => void;
@@ -243,6 +314,7 @@ interface DiscoveryDocument {
 interface VerifiedIdClaims {
   sub: string;
   nonce: string;
+  idp?: string;
 }
 
 interface StoredFlow {
@@ -272,6 +344,20 @@ interface PendingUpgrade {
   promise: Promise<GuestUpgradeResult>;
   settled: boolean;
   stop: () => void;
+}
+
+type EmailAction = keyof typeof EMAIL_ACTIONS;
+
+interface EmailActionResults {
+  add: AddEmailResult;
+  change: ChangeEmailResult;
+  remove: RemoveEmailResult;
+}
+
+interface PendingEmailWindow {
+  action: EmailAction;
+  popup: Window;
+  promise: Promise<EmailActionResults[EmailAction]>;
 }
 
 interface ParsedTokenSet {
@@ -635,7 +721,8 @@ export class Auth4BrowserClient {
   #renewTimer: ReturnType<typeof setTimeout> | undefined;
   #generation = 0;
   #upgrade: PendingUpgrade | undefined;
-  #addEmail: { popup: Window; promise: Promise<AddEmailResult> } | undefined;
+  /** The one pending add, change or remove email window. */
+  #emailWindow: PendingEmailWindow | undefined;
   readonly #listeners = new Set<BrowserSessionListener>();
 
   constructor(readonly options: BrowserClientOptions) {
@@ -999,7 +1086,11 @@ export class Auth4BrowserClient {
         discovery,
         options.signal,
       );
-      return this.startSession(tokens, { sub: claims.sub }, stored.nonce);
+      return this.startSession(
+        tokens,
+        { sub: claims.sub, ...(claims.idp === undefined ? {} : { idp: claims.idp }) },
+        stored.nonce,
+      );
     } catch (cause) {
       const cancelled = fromAbort(cause, options.signal);
       if (cancelled) throw cancelled;
@@ -1098,6 +1189,7 @@ export class Auth4BrowserClient {
       if (typeof record["email"] === "string") user.email = record["email"];
       if (typeof record["email_verified"] === "boolean")
         user.email_verified = record["email_verified"];
+      if (typeof record["idp"] === "string" && IDP.test(record["idp"])) user.idp = record["idp"];
       this.activeTokens.user = user;
       return user;
     } catch (cause) {
@@ -1472,20 +1564,66 @@ export class Auth4BrowserClient {
    * and an `email_added` session event is emitted.
    *
    * Rejects with `invalid_session`, `guest_account` (use upgradeGuest), `email_already_added`,
-   * `email_sign_in_disabled`, `popup_blocked`, `cancelled` ("Not now" or an aborted signal),
-   * `window_closed` or `add_email_failed` (for example when the request expired). An address that
-   * already belongs to another account is refused in the window, which lets the player try another.
+   * `email_sign_in_disabled`, `popup_blocked`, `email_window_open` (a change or removal window is
+   * pending), `cancelled` ("Not now" or an aborted signal), `window_closed` or `add_email_failed`
+   * (for example when the request expired). An address that already belongs to another account is
+   * refused in the window, which lets the player try another.
    */
   addEmail(options: AddEmailOptions = {}): Promise<AddEmailResult> {
-    const pending = this.#addEmail;
+    return this.openEmailWindow("add", options);
+  }
+
+  /**
+   * Let a signed-in player change the verified email address on their account (AUTH4D-256). It
+   * works like addEmail(): call it from a user gesture, the hosted /login/change-email window runs
+   * the email-code step for the new address, and the SDK polls with an in-memory poll secret. On
+   * success the old address stops working, the in-memory token set is replaced with the refreshed
+   * session for the same user and an `email_changed` session event is emitted.
+   *
+   * Rejects with `invalid_session`, `guest_account`, `email_not_added` (the account has no address
+   * to change; use addEmail), `email_sign_in_disabled`, `popup_blocked`, `email_window_open`,
+   * `cancelled`, `window_closed` or `change_email_failed`.
+   */
+  changeEmail(options: ChangeEmailOptions = {}): Promise<ChangeEmailResult> {
+    return this.openEmailWindow("change", options);
+  }
+
+  /**
+   * Let a signed-in player remove the email address from their account (AUTH4D-256). It works like
+   * addEmail(): call it from a user gesture, and the hosted /login/remove-email window asks the
+   * player to confirm. The address, and any password set for it, stop working. On success the
+   * in-memory token set is replaced with a refreshed session for the same user that has no email
+   * address, and an `email_removed` session event is emitted.
+   *
+   * Rejects with `invalid_session`, `guest_account`, `email_not_added`, `only_sign_in_method` (the
+   * address is the only way to sign in to the account), `popup_blocked`, `email_window_open`,
+   * `cancelled`, `window_closed` or `remove_email_failed`.
+   */
+  removeEmail(options: RemoveEmailOptions = {}): Promise<RemoveEmailResult> {
+    return this.openEmailWindow("remove", options);
+  }
+
+  /** Open the window for an email action inside the caller's gesture; one window at a time. */
+  private openEmailWindow<A extends EmailAction>(
+    action: A,
+    options: AddEmailOptions,
+  ): Promise<EmailActionResults[A]> {
+    const pending = this.#emailWindow;
     if (pending) {
       try {
         pending.popup.focus();
       } catch {
         // Focus is best effort.
       }
-      return pending.promise;
+      if (pending.action === action) return pending.promise as Promise<EmailActionResults[A]>;
+      return Promise.reject(
+        new Auth4BrowserError(
+          "email_window_open",
+          "Another email address window is open; finish or close it first.",
+        ),
+      );
     }
+    const settings = EMAIL_ACTIONS[action];
     let browser: Window;
     try {
       checkAbort(options.signal);
@@ -1504,56 +1642,60 @@ export class Auth4BrowserClient {
       return Promise.reject(
         cause instanceof Auth4BrowserError
           ? cause
-          : new Auth4BrowserError("configuration_error", "Adding an email needs a browser.", cause),
+          : new Auth4BrowserError(
+              "configuration_error",
+              `${settings.title} needs a browser.`,
+              cause,
+            ),
       );
     }
     let opened: Window | null;
     try {
       // Opened blank inside the caller's gesture; the page URL is known only once the intent exists.
-      opened = browser.open("about:blank", ADD_EMAIL_WINDOW_NAME, UPGRADE_WINDOW_FEATURES);
+      opened = browser.open("about:blank", settings.window, UPGRADE_WINDOW_FEATURES);
     } catch {
       opened = null;
     }
     if (!opened) {
       return Promise.reject(
-        new Auth4BrowserError("popup_blocked", "The browser blocked the add-email window."),
+        new Auth4BrowserError("popup_blocked", `The browser blocked the ${settings.label} window.`),
       );
     }
     const popup = opened;
-    const promise = this.runAddEmail(popup, options.signal).finally(() => {
-      if (this.#addEmail?.promise === promise) this.#addEmail = undefined;
+    const promise = this.runEmailAction(action, popup, options.signal).finally(() => {
+      if (this.#emailWindow?.promise === promise) this.#emailWindow = undefined;
     });
-    this.#addEmail = { popup, promise };
+    this.#emailWindow = { action, popup, promise };
     return promise;
   }
 
-  private async runAddEmail(popup: Window, signal?: AbortSignal): Promise<AddEmailResult> {
+  private async runEmailAction<A extends EmailAction>(
+    action: A,
+    popup: Window,
+    signal?: AbortSignal,
+  ): Promise<EmailActionResults[A]> {
+    const settings = EMAIL_ACTIONS[action];
     const generation = this.#generation;
     const subject = this.activeTokens!.user.sub;
     const authOrigin = new URL(this.options.issuer).origin;
     const sessionEnded = () =>
-      new Auth4BrowserError("invalid_session", "The session ended while adding an email address.");
+      new Auth4BrowserError("invalid_session", `The session ended while ${settings.doing}.`);
     try {
       const accessToken = await this.getAccessTokenSilently();
       if (!accessToken || generation !== this.#generation) throw sessionEnded();
       const created = await this.addEmailRequest(
         "/account/email/intent",
-        { client_id: this.options.clientId },
+        { client_id: this.options.clientId, action },
         signal,
         accessToken,
       );
       if (!created.ok) {
         if (created.error === "invalid_session" || created.status === 401) throw sessionEnded();
-        if (
-          created.error === "guest_account" ||
-          created.error === "email_already_added" ||
-          created.error === "email_sign_in_disabled"
-        ) {
-          throw new Auth4BrowserError(created.error, `Adding an email address was refused.`);
-        }
+        const refusal = EMAIL_INTENT_REFUSALS.find((code) => code === created.error);
+        if (refusal) throw new Auth4BrowserError(refusal, `${settings.title} was refused.`);
         throw new Auth4BrowserError(
-          "add_email_failed",
-          `The add-email request returned HTTP ${created.status}.`,
+          settings.failed,
+          `The ${settings.label} request returned HTTP ${created.status}.`,
         );
       }
       const { intent, poll_secret: pollSecret, expires_in: expiresIn } = created.body;
@@ -1564,18 +1706,22 @@ export class Auth4BrowserClient {
       } catch {
         page = null;
       }
+      // Only the hosted page for this action, on the auth origin, may be loaded in the window.
       if (
         typeof intent !== "string" ||
         !ADD_EMAIL_INTENT.test(intent) ||
         typeof pollSecret !== "string" ||
         !ADD_EMAIL_POLL_SECRET.test(pollSecret) ||
         page?.origin !== authOrigin ||
-        page.pathname !== "/login/add-email" ||
+        page.pathname !== settings.path ||
         typeof expiresIn !== "number" ||
         expiresIn <= 0 ||
         typeof interval !== "number"
       ) {
-        throw new Auth4BrowserError("add_email_failed", "The add-email response is malformed.");
+        throw new Auth4BrowserError(
+          settings.failed,
+          `The ${settings.label} response is malformed.`,
+        );
       }
       popup.location.replace(page.toString());
 
@@ -1599,9 +1745,9 @@ export class Auth4BrowserClient {
           intent,
           poll_secret: pollSecret,
         });
-        if (polled.ok) return this.completeAddEmail(polled.body, generation, subject);
+        if (polled.ok) return this.completeEmailAction(action, polled.body, generation, subject);
         if (polled.error === "access_denied") {
-          throw new Auth4BrowserError("cancelled", "The player chose not to add an email address.");
+          throw new Auth4BrowserError("cancelled", `The player chose not to ${settings.verb}.`);
         }
         if (polled.error === "slow_down") {
           const serverInterval = polled.body["interval"];
@@ -1611,17 +1757,17 @@ export class Auth4BrowserClient {
           );
         } else if (polled.error !== "authorization_pending") {
           throw new Auth4BrowserError(
-            "add_email_failed",
+            settings.failed,
             polled.error === "expired_token"
-              ? "The add-email request expired."
-              : `Adding an email address failed with HTTP ${polled.status}.`,
+              ? `The ${settings.label} request expired.`
+              : `${settings.title} failed with HTTP ${polled.status}.`,
           );
         } else if (windowClosed) {
           // The window was closed before the player finished, so nothing more can happen.
-          throw new Auth4BrowserError("window_closed", "The add-email window was closed.");
+          throw new Auth4BrowserError("window_closed", `The ${settings.label} window was closed.`);
         }
         if (this.currentTime() >= deadline) {
-          throw new Auth4BrowserError("add_email_failed", "The add-email request expired.");
+          throw new Auth4BrowserError(settings.failed, `The ${settings.label} request expired.`);
         }
       }
     } catch (cause) {
@@ -1633,7 +1779,7 @@ export class Auth4BrowserClient {
       const cancelled = fromAbort(cause, signal);
       if (cancelled) throw cancelled;
       if (cause instanceof Auth4BrowserError) throw cause;
-      throw new Auth4BrowserError("add_email_failed", "Unable to add an email address.", cause);
+      throw new Auth4BrowserError(settings.failed, `Unable to ${settings.verb}.`, cause);
     }
   }
 
@@ -1672,19 +1818,30 @@ export class Auth4BrowserClient {
     };
   }
 
-  /** Validate the refreshed session and swap the in-memory token set in one synchronous step. */
-  private completeAddEmail(
+  /**
+   * Validate the refreshed session and swap the in-memory token set in one synchronous step. An
+   * add or change result carries the new email identity; a removal result carries only tokens.
+   */
+  private completeEmailAction<A extends EmailAction>(
+    action: A,
     raw: Record<string, unknown>,
     generation: number,
     subject: string,
-  ): AddEmailResult {
+  ): EmailActionResults[A] {
+    const settings = EMAIL_ACTIONS[action];
     if (generation !== this.#generation || this.activeTokens?.user.sub !== subject) {
       throw new Auth4BrowserError(
         "invalid_session",
-        "The local session changed while adding an email address; sign in again.",
+        `The local session changed while ${settings.doing}; sign in again.`,
       );
     }
-    const { tokens, record } = readGuestTokenSet(raw, "add_email_failed", subject);
+    const { tokens, record } = readGuestTokenSet(raw, settings.failed, subject);
+    const nonce = this.activeTokens.nonce;
+    if (action === "remove") {
+      const session = this.startSession(tokens, { sub: subject }, nonce);
+      this.emit({ type: "email_removed", session });
+      return { session } as EmailActionResults[A];
+    }
     const identity = asRecord(record["identity"]);
     const identityId = identity?.["identity_id"];
     const email = record["email"];
@@ -1695,15 +1852,11 @@ export class Auth4BrowserClient {
       email.length === 0 ||
       email.length > 320
     ) {
-      throw new Auth4BrowserError("add_email_failed", "The add-email result is invalid.");
+      throw new Auth4BrowserError(settings.failed, `The ${settings.label} result is invalid.`);
     }
-    const session = this.startSession(
-      tokens,
-      { sub: subject, email, email_verified: true },
-      this.activeTokens.nonce,
-    );
-    this.emit({ type: "email_added", session });
-    return { session, email, identity: { identityId, provider: "email" } };
+    const session = this.startSession(tokens, { sub: subject, email, email_verified: true }, nonce);
+    this.emit({ type: action === "change" ? "email_changed" : "email_added", session });
+    return { session, email, identity: { identityId, provider: "email" } } as EmailActionResults[A];
   }
 
   /**
@@ -1962,11 +2115,18 @@ export class Auth4BrowserClient {
         typeof claims["auth_time"] !== "number" ||
         !Number.isInteger(claims["auth_time"]) ||
         claims["auth_time"] <= 0 ||
-        claims["auth_time"] > nowSeconds
+        claims["auth_time"] > nowSeconds ||
+        (claims["idp"] !== undefined &&
+          !(typeof claims["idp"] === "string" && IDP.test(claims["idp"])))
       ) {
         throw new Error("ID-token claims are invalid.");
       }
-      return { sub: claims["sub"], nonce: expectedNonce };
+      const idp = claims["idp"];
+      return {
+        sub: claims["sub"],
+        nonce: expectedNonce,
+        ...(typeof idp === "string" ? { idp } : {}),
+      };
     } catch (cause) {
       const cancelled = fromAbort(cause, signal);
       if (cancelled) throw cancelled;

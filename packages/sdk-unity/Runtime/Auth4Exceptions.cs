@@ -110,11 +110,20 @@ namespace Auth4
 
         /// <summary>The cancellation token fired; the game stopped waiting.</summary>
         Cancelled,
+
+        /// <summary>ChangeEmailAsync or RemoveEmailAsync: the account has no email address.</summary>
+        NotAdded,
+
+        /// <summary>
+        /// RemoveEmailAsync: the address is the player's only way to sign in, so it cannot be removed.
+        /// </summary>
+        OnlySignInMethod,
     }
 
     /// <summary>
-    /// AddEmailAsync ended without adding an address. The session is unchanged except after
-    /// Cancelled, when the player may still have finished in the browser.
+    /// AddEmailAsync, ChangeEmailAsync or RemoveEmailAsync ended without changing the address. The
+    /// session is unchanged except after Cancelled, when the player may still have finished in the
+    /// browser.
     /// </summary>
     public sealed class Auth4AddEmailException : Auth4Exception
     {

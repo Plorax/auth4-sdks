@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.7.0] - 2026-10-14
+
+### Added
+
+- `ChangeEmailAsync` lets a signed-in player replace their email address. It opens the hosted
+  `/login/change-email` page with the `BrowserLauncher`, polls while the player verifies the new
+  address with an email code, and then replaces the session with a refreshed one for the same user
+  and raises `SessionChanged`. It returns `ChangeEmailResult` with the session, the new address and
+  the new email identity.
+- `RemoveEmailAsync` lets a signed-in player remove their email address through the hosted
+  `/login/remove-email` page. It returns `RemoveEmailResult` with the refreshed session.
+- `AddEmailFailure.NotAdded` (the account has no email address to change or remove) and
+  `AddEmailFailure.OnlySignInMethod` (the address is the player's only way to sign in, so it can't
+  be removed).
+
+### Changed
+
+- Add, change and remove share one lock with the guest upgrade, so only one of them runs at a time.
+  Each opens only its own hosted page on the auth origin. `AddEmailAsync` sends the same request as
+  before.
+
 ## [0.6.0] - 2026-10-07
 
 ### Added

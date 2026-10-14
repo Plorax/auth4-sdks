@@ -1,7 +1,9 @@
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   Auth4BrowserClient,
   Auth4BrowserError,
+  type BrowserSessionEvent,
+  type BrowserUser,
   type BrowserStorage,
   type SocialProvider,
 } from "./index.ts";
@@ -753,5 +755,438 @@ describe("Auth4BrowserClient refresh (AUTH4D-65)", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// AUTH4D-256: changeEmail() and removeEmail() reuse the AUTH4D-149 add-email intent with an action.
+// The window and popup are in-memory fakes, the API is a mocked fetch and polling runs on fake
+// timers.
+describe("Auth4BrowserClient changeEmail and removeEmail (AUTH4D-256)", () => {
+  const authOrigin = "https://auth.auth4.dev";
+  const emailTenant = "ten_browserfixture0256";
+  const emailIssuer = `${authOrigin}/t/${emailTenant}`;
+  const emailClient = "cli_browserfixture0256";
+  const emailUser = "usr_steamfixture000256";
+  const intent = `aei_${"C".repeat(32)}`;
+  const pollSecret = `aep_${"P".repeat(43)}`;
+  const pageUri = (path: string, origin = authOrigin) =>
+    `${origin}${path}?tenant_id=${emailTenant}&client_id=${emailClient}&intent=${intent}`;
+
+  const encode = (value: unknown) => encodeBase64(new TextEncoder().encode(JSON.stringify(value)));
+  const accessToken = (claims: Record<string, unknown>, marker: string) =>
+    `${encode({ alg: "RS256", typ: "at+jwt" })}.${encode({
+      iss: emailIssuer,
+      sub: emailUser,
+      jti: marker,
+      ...claims,
+    })}.c2lnbmF0dXJl`;
+  const SIGNED_IN_TOKEN = accessToken({ email: "old@example.test" }, "signed-in");
+  const GUEST_TOKEN = accessToken({ auth4_guest: true }, "guest");
+  const CHANGED_TOKEN = accessToken({ email: "new@example.test" }, "changed");
+  const REMOVED_TOKEN = accessToken({}, "removed");
+  const OTHER_TOKEN = accessToken({}, "other-session");
+
+  interface FakePopup {
+    closed: boolean;
+    location: { replace(url: string): void; url: string | null };
+    close(): void;
+    focus(): void;
+  }
+
+  function fakePopup(): FakePopup {
+    return {
+      closed: false,
+      location: {
+        url: null,
+        replace(url) {
+          this.url = url;
+        },
+      },
+      close() {
+        this.closed = true;
+      },
+      focus() {},
+    };
+  }
+
+  class FakeWindow {
+    readonly opened: { url: string; target: string }[] = [];
+    popup: FakePopup | null = fakePopup();
+    open(url: string, target: string): FakePopup | null {
+      this.opened.push({ url, target });
+      return this.popup;
+    }
+    addEventListener(): void {}
+    removeEventListener(): void {}
+  }
+
+  type Reply = { status: number; body: Record<string, unknown> };
+  let browser: FakeWindow;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: Date.UTC(2026, 9, 13, 12, 0, 0) });
+    browser = new FakeWindow();
+    vi.stubGlobal("window", browser);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  function created(path: string, origin = authOrigin): Reply {
+    return {
+      status: 200,
+      body: {
+        intent,
+        poll_secret: pollSecret,
+        add_email_uri: pageUri(path, origin),
+        expires_in: 600,
+        interval: 5,
+      },
+    };
+  }
+
+  const changed: Reply = {
+    status: 200,
+    body: {
+      user_id: emailUser,
+      identity: { identity_id: "idn_newemailfixture256", provider: "email" },
+      email: "new@example.test",
+      access_token: CHANGED_TOKEN,
+      token_type: "Bearer",
+      expires_in: 300,
+      session_id: "ses_changedfixture0256",
+    },
+  };
+
+  // A removal releases only the user ID, the token set and the session ID.
+  const removed: Reply = {
+    status: 200,
+    body: {
+      user_id: emailUser,
+      access_token: REMOVED_TOKEN,
+      token_type: "Bearer",
+      expires_in: 300,
+      session_id: "ses_removedfixture0256",
+    },
+  };
+
+  function emailHarness(args: {
+    create: Reply;
+    polls?: Reply[];
+    onPoll?: () => Promise<void> | void;
+  }) {
+    const polls = [...(args.polls ?? [])];
+    const requests: { url: string; body: Record<string, unknown>; at: number }[] = [];
+    let sessionToken = SIGNED_IN_TOKEN;
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      requests.push({
+        url,
+        body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+        at: Date.now(),
+      });
+      if (url === `${emailIssuer}/guest`) {
+        return Response.json({
+          user_id: emailUser,
+          upgrade_proof: { proof_id: "prf_fixture0000000256", expires_in: 300 },
+          access_token: sessionToken,
+          token_type: "Bearer",
+          expires_in: 300,
+        });
+      }
+      if (url === `${emailIssuer}/account/email/intent`) {
+        return Response.json(args.create.body, { status: args.create.status });
+      }
+      if (url === `${emailIssuer}/account/email/intent/token`) {
+        await args.onPoll?.();
+        const next = polls.shift() ?? { status: 400, body: { error: "authorization_pending" } };
+        return Response.json(next.body, { status: next.status });
+      }
+      return new Response(null, { status: 404 });
+    };
+    const client = new Auth4BrowserClient({
+      issuer: emailIssuer,
+      clientId: emailClient,
+      redirectUri: "https://game.example.test/callback",
+      fetch: fetcher,
+      now: () => Date.now(),
+    });
+    const events: BrowserSessionEvent[] = [];
+    client.onSessionEvent((event) => events.push(event));
+    // signInAsGuest() is the simplest way to install a session; without the auth4_guest claim the
+    // token stands for a regular signed-in account.
+    const signIn = async (token = SIGNED_IN_TOKEN) => {
+      sessionToken = token;
+      await client.signInAsGuest();
+    };
+    const intentBodies = () =>
+      requests
+        .filter((entry) => entry.url.endsWith("/account/email/intent"))
+        .map((entry) => entry.body);
+    const pollTimes = () =>
+      requests.filter((entry) => entry.url.endsWith("/intent/token")).map((entry) => entry.at);
+    return { client, events, signIn, intentBodies, pollTimes };
+  }
+
+  it("changes the address: sends action change, opens the change page and swaps the session", async () => {
+    const { client, events, signIn, intentBodies } = emailHarness({
+      create: created("/login/change-email"),
+      polls: [{ status: 400, body: { error: "authorization_pending", interval: 5 } }, changed],
+    });
+    await signIn();
+    const result = client.changeEmail();
+    // The window opens synchronously, inside the caller's gesture.
+    expect(browser.opened).toEqual([{ url: "about:blank", target: "auth4-change-email" }]);
+    await vi.advanceTimersByTimeAsync(11_000);
+    const outcome = await result;
+    expect(intentBodies()).toEqual([{ client_id: emailClient, action: "change" }]);
+    expect(browser.popup?.location.url).toBe(pageUri("/login/change-email"));
+    expect(browser.popup?.location.url).not.toContain(pollSecret);
+    expect(outcome.email).toBe("new@example.test");
+    expect(outcome.identity).toEqual({ identityId: "idn_newemailfixture256", provider: "email" });
+    expect(outcome.session.user).toEqual({
+      sub: emailUser,
+      email: "new@example.test",
+      email_verified: true,
+    });
+    expect(client.getSession()?.user.email).toBe("new@example.test");
+    expect(client.getAccessToken()).toBe(CHANGED_TOKEN);
+    expect(events.map((event) => event.type)).toEqual(["email_changed"]);
+    expect(JSON.stringify(events)).not.toContain(CHANGED_TOKEN);
+  });
+
+  it("removes the address: sends action remove and leaves a session without email", async () => {
+    const { client, events, signIn, intentBodies } = emailHarness({
+      create: created("/login/remove-email"),
+      polls: [removed],
+    });
+    await signIn();
+    const result = client.removeEmail();
+    expect(browser.opened).toEqual([{ url: "about:blank", target: "auth4-remove-email" }]);
+    await vi.advanceTimersByTimeAsync(6_000);
+    const outcome = await result;
+    expect(intentBodies()).toEqual([{ client_id: emailClient, action: "remove" }]);
+    expect(browser.popup?.location.url).toBe(pageUri("/login/remove-email"));
+    expect(Object.keys(outcome)).toEqual(["session"]);
+    expect(outcome.session.user).toEqual({ sub: emailUser });
+    expect(client.getSession()?.user.email).toBeUndefined();
+    expect(client.getAccessToken()).toBe(REMOVED_TOKEN);
+    expect(events.map((event) => event.type)).toEqual(["email_removed"]);
+  });
+
+  it("accepts only the hosted page that matches the action, on the auth origin", async () => {
+    const cases: [Reply, "changeEmail" | "removeEmail", string][] = [
+      [created("/login/add-email"), "changeEmail", "change_email_failed"],
+      [created("/login/remove-email"), "changeEmail", "change_email_failed"],
+      [
+        created("/login/change-email", "https://evil.example.test"),
+        "changeEmail",
+        "change_email_failed",
+      ],
+      [created("/login/change-email"), "removeEmail", "remove_email_failed"],
+      [created("/login/add-email"), "removeEmail", "remove_email_failed"],
+    ];
+    for (const [reply, method, code] of cases) {
+      const popup = fakePopup();
+      browser.popup = popup;
+      const { client, events, signIn } = emailHarness({ create: reply });
+      await signIn();
+      await expect(client[method]()).rejects.toMatchObject({ code });
+      expect(popup.location.url).toBeNull();
+      expect(popup.closed).toBe(true);
+      expect(client.getAccessToken()).toBe(SIGNED_IN_TOKEN);
+      expect(events).toEqual([]);
+    }
+  });
+
+  it("surfaces email_not_added and only_sign_in_method as error codes", async () => {
+    const notAdded = emailHarness({ create: { status: 409, body: { error: "email_not_added" } } });
+    await notAdded.signIn();
+    const change = notAdded.client.changeEmail();
+    await expect(change).rejects.toBeInstanceOf(Auth4BrowserError);
+    await expect(change).rejects.toMatchObject({ code: "email_not_added" });
+    expect(browser.popup?.closed).toBe(true);
+
+    const popup = fakePopup();
+    browser.popup = popup;
+    const only = emailHarness({ create: { status: 409, body: { error: "only_sign_in_method" } } });
+    await only.signIn();
+    await expect(only.client.removeEmail()).rejects.toMatchObject({ code: "only_sign_in_method" });
+    expect(popup.closed).toBe(true);
+    expect(only.client.getAccessToken()).toBe(SIGNED_IN_TOKEN);
+  });
+
+  it("reports Not now as cancelled and a closed window as window_closed", async () => {
+    const denied = emailHarness({
+      create: created("/login/remove-email"),
+      polls: [{ status: 400, body: { error: "access_denied" } }],
+    });
+    await denied.signIn();
+    const cancelled = expect(denied.client.removeEmail()).rejects.toMatchObject({
+      code: "cancelled",
+    });
+    await vi.advanceTimersByTimeAsync(6_000);
+    await cancelled;
+
+    const popup = fakePopup();
+    browser.popup = popup;
+    const closed = emailHarness({ create: created("/login/change-email") });
+    await closed.signIn();
+    const pending = expect(closed.client.changeEmail()).rejects.toMatchObject({
+      code: "window_closed",
+    });
+    popup.closed = true;
+    await vi.advanceTimersByTimeAsync(6_000);
+    await pending;
+    expect(closed.client.getAccessToken()).toBe(SIGNED_IN_TOKEN);
+  });
+
+  it("backs off on slow_down", async () => {
+    const { client, signIn, pollTimes } = emailHarness({
+      create: created("/login/change-email"),
+      polls: [{ status: 400, body: { error: "slow_down", interval: 10 } }, changed],
+    });
+    await signIn();
+    const start = Date.now();
+    const result = client.changeEmail();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(pollTimes()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(9_000);
+    expect(pollTimes()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(result).resolves.toMatchObject({ email: "new@example.test" });
+    expect(pollTimes().map((at) => at - start)).toEqual([5_000, 15_000]);
+  });
+
+  it("refuses guests and missing sessions without opening a window", async () => {
+    const { client, signIn } = emailHarness({ create: created("/login/change-email") });
+    await expect(client.changeEmail()).rejects.toMatchObject({ code: "invalid_session" });
+    await signIn(GUEST_TOKEN);
+    expect(client.getSession()?.isGuest).toBe(true);
+    await expect(client.changeEmail()).rejects.toMatchObject({ code: "guest_account" });
+    await expect(client.removeEmail()).rejects.toMatchObject({ code: "guest_account" });
+    expect(browser.opened).toEqual([]);
+  });
+
+  it("gives invalid_session when the session changes mid-flow and keeps the new session", async () => {
+    // Between polls: the loop notices the new session generation.
+    const between = emailHarness({ create: created("/login/change-email"), polls: [changed] });
+    await between.signIn();
+    const first = expect(between.client.changeEmail()).rejects.toMatchObject({
+      code: "invalid_session",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await between.signIn(OTHER_TOKEN);
+    await vi.advanceTimersByTimeAsync(6_000);
+    await first;
+    expect(between.client.getAccessToken()).toBe(OTHER_TOKEN);
+    expect(between.events).toEqual([]);
+
+    // During the poll that releases the tokens: they are discarded rather than swapped in.
+    browser.popup = fakePopup();
+    const hooks: { swap?: () => Promise<void> } = {};
+    const during = emailHarness({
+      create: created("/login/remove-email"),
+      polls: [removed],
+      onPoll: () => hooks.swap?.(),
+    });
+    await during.signIn();
+    hooks.swap = () => during.signIn(OTHER_TOKEN);
+    const second = expect(during.client.removeEmail()).rejects.toMatchObject({
+      code: "invalid_session",
+    });
+    await vi.advanceTimersByTimeAsync(6_000);
+    await second;
+    expect(during.client.getAccessToken()).toBe(OTHER_TOKEN);
+    expect(during.events).toEqual([]);
+  });
+
+  it("keeps one email window at a time and supports AbortSignal", async () => {
+    const { client, signIn } = emailHarness({ create: created("/login/change-email") });
+    await signIn();
+    const controller = new AbortController();
+    const change = client.changeEmail({ signal: controller.signal });
+    expect(client.changeEmail()).toBe(change);
+    await expect(client.removeEmail()).rejects.toMatchObject({ code: "email_window_open" });
+    await expect(client.addEmail()).rejects.toMatchObject({ code: "email_window_open" });
+    expect(browser.opened).toHaveLength(1);
+    const cancelled = expect(change).rejects.toMatchObject({ code: "cancelled" });
+    await vi.advanceTimersByTimeAsync(1_000);
+    controller.abort();
+    await cancelled;
+    expect(browser.popup?.closed).toBe(true);
+    expect(client.getAccessToken()).toBe(SIGNED_IN_TOKEN);
+  });
+});
+
+describe("Auth4BrowserClient idp claim (AUTH4D-270)", () => {
+  async function signInWith(
+    idClaims: Record<string, unknown>,
+    userInfo: Record<string, unknown> = { sub: "usr_browserfixture0001" },
+  ) {
+    let expectedNonce = "";
+    const { client } = makeClient({
+      onRequest: async (url) => {
+        if (url === `${issuer}/.well-known/openid-configuration`) return jsonResponse(discovery());
+        if (url === `${issuer}/.well-known/jwks.json`) return jsonResponse({ keys: [publicJwk] });
+        if (url.startsWith("https://auth.auth4.dev/oauth/token")) {
+          return jsonResponse(await tokenBody(expectedNonce, idClaims));
+        }
+        if (url.startsWith("https://auth.auth4.dev/oauth/userinfo")) return jsonResponse(userInfo);
+        return new Response(null, { status: 404 });
+      },
+    });
+    const flow = await beginFlow(client);
+    expectedNonce = flow.nonce;
+    const callback = new URL(redirectUri);
+    callback.searchParams.set("code", "code");
+    callback.searchParams.set("state", flow.state);
+    return { client, session: client.handleCallback(callback) };
+  }
+
+  it("types a Steam sign-in with a verified email and idp", async () => {
+    const { client, session } = await signInWith(
+      { email: "player@example.test", email_verified: true, idp: "steam" },
+      {
+        sub: "usr_browserfixture0001",
+        email: "player@example.test",
+        email_verified: true,
+        idp: "steam",
+      },
+    );
+    const user: BrowserUser = (await session).user;
+    expect(user).toEqual({ sub: "usr_browserfixture0001", idp: "steam" });
+    await expect(client.getUser()).resolves.toEqual({
+      sub: "usr_browserfixture0001",
+      email: "player@example.test",
+      email_verified: true,
+      idp: "steam",
+    });
+  });
+
+  it("leaves email and idp out when neither the token nor UserInfo has them", async () => {
+    const { client, session } = await signInWith({});
+    expect((await session).user).toEqual({ sub: "usr_browserfixture0001" });
+    await expect(client.getUser()).resolves.toEqual({ sub: "usr_browserfixture0001" });
+  });
+
+  it("accepts an idp this SDK version does not know yet", async () => {
+    const { session } = await signInWith({ idp: "future_method" });
+    expect((await session).user.idp).toBe("future_method");
+  });
+
+  it("rejects an ID token with a malformed idp and ignores one in UserInfo", async () => {
+    for (const idp of ["Steam!", 7, ""]) {
+      const { session } = await signInWith({ idp });
+      await expect(session).rejects.toMatchObject({ code: "invalid_id_token" });
+    }
+    const { client, session } = await signInWith(
+      {},
+      { sub: "usr_browserfixture0001", idp: "<script>" },
+    );
+    await session;
+    await expect(client.getUser()).resolves.toEqual({ sub: "usr_browserfixture0001" });
   });
 });

@@ -579,19 +579,66 @@ namespace Auth4
             Action<GuestUpgradeProgress> onProgress = null,
             CancellationToken cancellationToken = default)
         {
+            var outcome = await EmailActionAsync(EmailAction.Add, onProgress, cancellationToken);
+            return new AddEmailResult(outcome.Session, outcome.Email, outcome.Identity);
+        }
+
+        /// <summary>
+        /// Lets a signed-in player replace the email address on their account (AUTH4D-276). It works like
+        /// AddEmailAsync, but opens the hosted change-email page, where the player proves the new address
+        /// with an email code. The old email identity is replaced by a new one for the same user, the
+        /// session is replaced with a refreshed one, and SessionChanged is raised.
+        ///
+        /// Failures that end the request throw Auth4AddEmailException (GuestAccount, NotAdded,
+        /// EmailSignInDisabled, Expired, Denied or Cancelled). An address that already belongs to another
+        /// account is refused on the page. Without a supported BrowserLauncher it throws
+        /// PlatformNotSupportedException.
+        /// </summary>
+        public async Task<ChangeEmailResult> ChangeEmailAsync(
+            Action<GuestUpgradeProgress> onProgress = null,
+            CancellationToken cancellationToken = default)
+        {
+            var outcome = await EmailActionAsync(EmailAction.Change, onProgress, cancellationToken);
+            return new ChangeEmailResult(outcome.Session, outcome.Email, outcome.Identity);
+        }
+
+        /// <summary>
+        /// Lets a signed-in player remove the email address from their account (AUTH4D-276). It opens the
+        /// hosted remove-email page, where the player confirms, and polls like AddEmailAsync. The session
+        /// is then replaced with a refreshed one for the same user, and SessionChanged is raised.
+        ///
+        /// Failures that end the request throw Auth4AddEmailException (GuestAccount, NotAdded,
+        /// OnlySignInMethod, Expired, Denied or Cancelled). OnlySignInMethod means the address is the
+        /// only way the player can sign in, so it cannot be removed. Without a supported BrowserLauncher
+        /// it throws PlatformNotSupportedException.
+        /// </summary>
+        public async Task<RemoveEmailResult> RemoveEmailAsync(
+            Action<GuestUpgradeProgress> onProgress = null,
+            CancellationToken cancellationToken = default)
+        {
+            var outcome = await EmailActionAsync(EmailAction.Remove, onProgress, cancellationToken);
+            return new RemoveEmailResult(outcome.Session);
+        }
+
+        private async Task<EmailActionOutcome> EmailActionAsync(
+            EmailAction action,
+            Action<GuestUpgradeProgress> onProgress,
+            CancellationToken cancellationToken)
+        {
+            var settings = EmailActionSettings.For(action);
             if (_browserLauncher == null || !_browserLauncher.IsSupported)
             {
-                throw new PlatformNotSupportedException("AddEmailAsync needs a supported BrowserLauncher.");
+                throw new PlatformNotSupportedException(settings.Method + " needs a supported BrowserLauncher.");
             }
 
             if (Interlocked.CompareExchange(ref _upgradeInFlight, 1, 0) != 0)
             {
-                throw new InvalidOperationException("A guest upgrade or add-email request is already in progress.");
+                throw new InvalidOperationException("A guest upgrade or account email request is already in progress.");
             }
 
             try
             {
-                return await AddEmailCoreAsync(onProgress, cancellationToken);
+                return await EmailActionCoreAsync(settings, onProgress, cancellationToken);
             }
             catch (OperationCanceledException error) when (cancellationToken.IsCancellationRequested)
             {
@@ -906,7 +953,8 @@ namespace Auth4
             }
         }
 
-        private async Task<AddEmailResult> AddEmailCoreAsync(
+        private async Task<EmailActionOutcome> EmailActionCoreAsync(
+            EmailActionSettings settings,
             Action<GuestUpgradeProgress> onProgress,
             CancellationToken cancellationToken)
         {
@@ -924,9 +972,14 @@ namespace Auth4
                 throw new Auth4Exception("login_required", "No session is active.");
             }
 
-            var request = JsonRequest(
-                Endpoint("/t/" + Escape(TenantId) + "/account/email/intent"),
-                new Dictionary<string, string> { ["client_id"] = ClientId });
+            // Adding is the server's default action, so its request stays as it was before AUTH4D-276.
+            var fields = new Dictionary<string, string> { ["client_id"] = ClientId };
+            if (settings.Action != null)
+            {
+                fields["action"] = settings.Action;
+            }
+
+            var request = JsonRequest(Endpoint("/t/" + Escape(TenantId) + "/account/email/intent"), fields);
             request.Headers["Authorization"] = "Bearer " + accessToken;
             var response = await SendAsync(request, cancellationToken);
             var json = Auth4Json.TryParseObject(response.Body);
@@ -941,6 +994,10 @@ namespace Auth4
                         throw new Auth4AddEmailException(AddEmailFailure.AlreadyAdded, refused.Error, response.StatusCode);
                     case "email_sign_in_disabled":
                         throw new Auth4AddEmailException(AddEmailFailure.EmailSignInDisabled, refused.Error, response.StatusCode);
+                    case "email_not_added":
+                        throw new Auth4AddEmailException(AddEmailFailure.NotAdded, refused.Error, response.StatusCode);
+                    case "only_sign_in_method":
+                        throw new Auth4AddEmailException(AddEmailFailure.OnlySignInMethod, refused.Error, response.StatusCode);
                 }
 
                 throw refused;
@@ -953,10 +1010,10 @@ namespace Auth4
             var interval = Auth4Json.GetNumber(json, "interval") ?? MinimumPollIntervalSeconds;
             if (intent == null || !AddEmailIntentPattern.IsMatch(intent) ||
                 pollSecret == null || !AddEmailSecretPattern.IsMatch(pollSecret) ||
-                pageUri == null || pageUri.AbsolutePath != "/login/add-email" ||
+                pageUri == null || pageUri.AbsolutePath != settings.PagePath ||
                 expiresIn == null || expiresIn <= 0 || expiresIn > MaxTokenLifetimeSeconds || interval > 3_600)
             {
-                throw InvalidResponse(response.StatusCode, "The add-email response is malformed.");
+                throw InvalidResponse(response.StatusCode, "The " + settings.Label + " response is malformed.");
             }
 
             var expiresAt = _clock.UtcNow.AddSeconds(expiresIn.Value);
@@ -1008,7 +1065,7 @@ namespace Auth4
                 var body = Auth4Json.TryParseObject(poll.Body);
                 if (poll.StatusCode == 200)
                 {
-                    var result = await CommitAddEmailAsync(poll, body, current.UserId, generation);
+                    var result = await CommitEmailActionAsync(settings, poll, body, current.UserId, generation);
                     ReportProgress(onProgress, new GuestUpgradeProgress(
                         GuestUpgradeStage.Completed, pageUri, expiresAt, pollInterval, attempt));
                     return result;
@@ -1051,9 +1108,11 @@ namespace Auth4
 
         /// <summary>
         /// Replaces the session with the refreshed one under the gate, so storage and memory switch
-        /// together. The user must be unchanged; an explicit sign-out wins.
+        /// together. The user must be unchanged; an explicit sign-out wins. An add or change result
+        /// carries the new email identity and its address; a removal result carries neither.
         /// </summary>
-        private async Task<AddEmailResult> CommitAddEmailAsync(
+        private async Task<EmailActionOutcome> CommitEmailActionAsync(
+            EmailActionSettings settings,
             Auth4HttpResponse response,
             Dictionary<string, object> json,
             string knownUserId,
@@ -1077,25 +1136,29 @@ namespace Auth4
                 {
                     await RevokeQuietlyAsync(tokens.RefreshToken ?? tokens.AccessToken, tokens.RefreshToken != null);
                     throw new InvalidOperationException(
-                        "The player signed out before the email address was added; sign in again.");
+                        "The player signed out before the email address was " + settings.Done + "; sign in again.");
                 }
 
-                if (string.IsNullOrEmpty(userId) || (knownUserId != null && userId != knownUserId) ||
-                    identity == null || Auth4Json.GetString(identity, "provider") != "email" ||
-                    string.IsNullOrEmpty(email))
+                var shapeIsValid = settings.Removes
+                    ? identity == null
+                    : identity != null && Auth4Json.GetString(identity, "provider") == "email" &&
+                      !string.IsNullOrEmpty(email);
+                if (string.IsNullOrEmpty(userId) || (knownUserId != null && userId != knownUserId) || !shapeIsValid)
                 {
                     await RevokeQuietlyAsync(tokens.RefreshToken ?? tokens.AccessToken, tokens.RefreshToken != null);
                     await ClearLocalAsync();
-                    throw InvalidResponse(response.StatusCode, "The add-email result did not preserve the user.");
+                    throw InvalidResponse(response.StatusCode, "The " + settings.Label + " result did not preserve the user.");
                 }
 
                 tokens.UserId = userId;
                 tokens.IsGuest = false;
                 var session = await CommitAsync(tokens);
-                return new AddEmailResult(
-                    session,
-                    email,
-                    new LinkedIdentity(Auth4Json.GetString(identity, "identity_id"), "email"));
+                return settings.Removes
+                    ? new EmailActionOutcome(session, null, null)
+                    : new EmailActionOutcome(
+                        session,
+                        email,
+                        new LinkedIdentity(Auth4Json.GetString(identity, "identity_id"), "email"));
             }
             finally
             {
@@ -1972,6 +2035,81 @@ namespace Auth4
                     RefreshToken != null,
                     persistent && RefreshToken != null);
             }
+        }
+
+        private enum EmailAction
+        {
+            Add,
+            Change,
+            Remove,
+        }
+
+        /// <summary>
+        /// Per-action request and checks for the account email intent, matching the browser SDK's
+        /// EMAIL_ACTIONS: only the hosted page for the action may be opened.
+        /// </summary>
+        private sealed class EmailActionSettings
+        {
+            private static readonly EmailActionSettings AddSettings =
+                new EmailActionSettings(null, "/login/add-email", "add-email", "added", "AddEmailAsync", false);
+
+            private static readonly EmailActionSettings ChangeSettings =
+                new EmailActionSettings("change", "/login/change-email", "change-email", "changed", "ChangeEmailAsync", false);
+
+            private static readonly EmailActionSettings RemoveSettings =
+                new EmailActionSettings("remove", "/login/remove-email", "remove-email", "removed", "RemoveEmailAsync", true);
+
+            private EmailActionSettings(string action, string pagePath, string label, string done, string method, bool removes)
+            {
+                Action = action;
+                PagePath = pagePath;
+                Label = label;
+                Done = done;
+                Method = method;
+                Removes = removes;
+            }
+
+            /// <summary>The action sent in the intent request; null for add, the server default.</summary>
+            public string Action { get; }
+
+            public string PagePath { get; }
+
+            public string Label { get; }
+
+            public string Done { get; }
+
+            public string Method { get; }
+
+            public bool Removes { get; }
+
+            public static EmailActionSettings For(EmailAction action)
+            {
+                switch (action)
+                {
+                    case EmailAction.Change:
+                        return ChangeSettings;
+                    case EmailAction.Remove:
+                        return RemoveSettings;
+                    default:
+                        return AddSettings;
+                }
+            }
+        }
+
+        private sealed class EmailActionOutcome
+        {
+            public EmailActionOutcome(Auth4Session session, string email, LinkedIdentity identity)
+            {
+                Session = session;
+                Email = email;
+                Identity = identity;
+            }
+
+            public Auth4Session Session { get; }
+
+            public string Email { get; }
+
+            public LinkedIdentity Identity { get; }
         }
     }
 }

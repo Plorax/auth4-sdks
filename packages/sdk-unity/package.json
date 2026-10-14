@@ -1,8 +1,8 @@
 {
   "name": "dev.auth4.sdk",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "displayName": "auth4.dev Authentication",
-  "description": "Game authentication for auth4.dev: device login, guest sessions with safe upgrades by email or social providers (in the system browser, or a popup in WebGL builds), adding a verified email address to a signed-in account, and rotating refresh tokens kept in memory unless a secure storage adapter is supplied.",
+  "description": "Game authentication for auth4.dev: device login, guest sessions with safe upgrades by email or social providers (in the system browser, or a popup in WebGL builds), adding, changing or removing a verified email address on a signed-in account, and rotating refresh tokens kept in memory unless a secure storage adapter is supplied.",
   "unity": "2022.3",
   "documentationUrl": "https://auth4.dev/docs/unity",
   "changelogUrl": "https://auth4.dev/docs/unity/changelog",

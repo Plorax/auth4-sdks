@@ -231,6 +231,39 @@ An address that already belongs to another player is refused on the page without
 the player can try a different one. Guests use `UpgradeGuestAsync` instead. The page URL holds
 only a public handle; the poll secret and tokens stay in the game.
 
+## Changing or removing an email address
+
+`ChangeEmailAsync` and `RemoveEmailAsync` work the same way. They open the hosted
+`/login/change-email` or `/login/remove-email` page, poll, and then replace the session with a
+refreshed one for the same user and raise `SessionChanged`:
+
+```csharp
+try
+{
+    var changed = await client.ChangeEmailAsync(cancellationToken: cts.Token);
+    Debug.Log("You now sign in with " + changed.Email);
+}
+catch (Auth4AddEmailException error)
+{
+    // GuestAccount, NotAdded, EmailSignInDisabled, Expired, Denied or Cancelled.
+    Debug.Log("The email address was not changed: " + error.Reason);
+}
+
+try
+{
+    await client.RemoveEmailAsync(cancellationToken: cts.Token);
+}
+catch (Auth4AddEmailException error) when (error.Reason == AddEmailFailure.OnlySignInMethod)
+{
+    // The address is the player's only way to sign in; link another account first.
+}
+```
+
+A change sends a code to the new address, and `ChangeEmailResult` holds the new address and email
+identity. A removal needs only the player's confirmation and returns `RemoveEmailResult` with the
+session. Each method opens only its own hosted page on the auth origin. Only one guest upgrade or
+email request runs at a time; a second call throws `InvalidOperationException`.
+
 ## Tokens
 
 `GetAccessTokenAsync()` returns the in-memory access token, refreshing 30 seconds before expiry

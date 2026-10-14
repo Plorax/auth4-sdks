@@ -220,6 +220,37 @@ namespace Auth4
         public LinkedIdentity Identity { get; }
     }
 
+    /// <summary>
+    /// Returned by ChangeEmailAsync: the refreshed session, the new address the player verified and the
+    /// email identity that now holds it.
+    /// </summary>
+    public sealed class ChangeEmailResult
+    {
+        internal ChangeEmailResult(Auth4Session session, string email, LinkedIdentity identity)
+        {
+            Session = session;
+            Email = email;
+            Identity = identity;
+        }
+
+        public Auth4Session Session { get; }
+
+        public string Email { get; }
+
+        public LinkedIdentity Identity { get; }
+    }
+
+    /// <summary>Returned by RemoveEmailAsync: the refreshed session, which no longer has an email address.</summary>
+    public sealed class RemoveEmailResult
+    {
+        internal RemoveEmailResult(Auth4Session session)
+        {
+            Session = session;
+        }
+
+        public Auth4Session Session { get; }
+    }
+
     public sealed class GuestUpgradeResult
     {
         internal GuestUpgradeResult(Auth4Session session, LinkedIdentity identity)

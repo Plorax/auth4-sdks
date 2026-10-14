@@ -41,6 +41,8 @@ const TOKEN_LIFETIME_LIMIT_SECONDS = 300;
 const DISCOVERY_CACHE_MS = 600_000;
 const JWKS_CACHE_MS = 300_000;
 const CLOCK_TOLERANCE_SECONDS = 30;
+/** AUTH4D-258 IdpClaimSchema: any well-formed method name, so a new method is still accepted. */
+const IDP = /^[a-z][a-z0-9_]{1,31}$/u;
 const PROTOCOL_CLAIMS = new Set([
   "iss",
   "aud",
@@ -175,7 +177,12 @@ export class OidcClient {
       exp - iat > TOKEN_LIFETIME_LIMIT_SECONDS ||
       (nonce === undefined ? !expected.nonceOptional : nonce !== expected.nonce) ||
       typeof authTime !== "number" ||
-      !Number.isInteger(authTime)
+      !Number.isInteger(authTime) ||
+      // The typed User claims must have the types the User interface promises.
+      (claims["email"] !== undefined && typeof claims["email"] !== "string") ||
+      (claims["email_verified"] !== undefined && typeof claims["email_verified"] !== "boolean") ||
+      (claims["idp"] !== undefined &&
+        !(typeof claims["idp"] === "string" && IDP.test(claims["idp"])))
     ) {
       throw new Error("ID-token claims are invalid.");
     }

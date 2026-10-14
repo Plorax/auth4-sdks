@@ -7,6 +7,11 @@ export interface User {
   sub: string;
   email?: string;
   email_verified?: boolean;
+  /**
+   * The method used for this sign-in, such as "steam", "discord", "email" or "guest" (AUTH4D-258).
+   * Later releases may add methods, so treat unknown values as valid.
+   */
+  idp?: string;
   [claim: string]: unknown;
 }
 
