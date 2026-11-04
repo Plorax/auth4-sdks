@@ -41,6 +41,12 @@ namespace Auth4
         /// </summary>
         public IAuth4UpgradeWindow UpgradeWindow { get; set; }
 
+        /// <summary>
+        /// Apple Game Center for SignInWithGameCenterAsync (AUTH4D-311), on iOS and macOS. When null,
+        /// Game Center sign-in is unavailable.
+        /// </summary>
+        public IAuth4GameCenter GameCenter { get; set; }
+
         /// <summary>Refresh this long before the access token expires.</summary>
         public TimeSpan AccessTokenRefreshMargin { get; set; } = TimeSpan.FromSeconds(30);
 

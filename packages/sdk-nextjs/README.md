@@ -37,6 +37,20 @@ URI. Use `refresh: true` only when the application allows refresh tokens in the 
 See the [Next.js quickstart](https://auth4.dev/docs/nextjs/), including a section for apps coming
 from `@auth0/nextjs-auth0`, and [limitations](https://auth4.dev/docs/limitations/).
 
+## Pending sign-in cookies
+
+Each sign-in or hosted sign-out attempt keeps one encrypted `auth4_tx_<state>` cookie on the callback
+path, plus a small `auth4_txi` index cookie on `/` that lets a new login evict old attempts (the
+browser does not send callback-path cookies to the login route). All pending attempts together stay
+within `transactions.maxBytes` (default 3500 bytes, index included); each cookie stays under 4,096
+bytes with its attributes.
+
+- Starting an attempt that does not fit evicts the oldest ones. A player who finishes an evicted,
+  expired or tampered attempt gets the `invalid_state` callback error and starts again.
+- `returnTo` values longer than 1,024 characters fall back to the application root.
+- Cookies from earlier versions (no index entry) are removed at the callback when they are expired
+  or cannot be opened; valid ones expire on their own within 15 minutes.
+
 ## Development
 
 ```sh

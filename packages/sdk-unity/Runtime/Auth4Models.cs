@@ -56,8 +56,10 @@ namespace Auth4
             Uri verificationUriComplete,
             DateTimeOffset expiresAt,
             int intervalSeconds,
-            string scope)
+            string scope,
+            int generation)
         {
+            Generation = generation;
             DeviceCode = deviceCode;
             UserCode = userCode;
             VerificationUri = verificationUri;
@@ -68,6 +70,9 @@ namespace Auth4
         }
 
         internal string DeviceCode { get; }
+
+        /// <summary>The sign-out generation in which this authorization began.</summary>
+        internal int Generation { get; }
 
         public string UserCode { get; }
 
@@ -251,6 +256,66 @@ namespace Auth4
         public Auth4Session Session { get; }
     }
 
+    /// <summary>Provider accounts a signed-in player can link and unlink (AUTH4D-308).</summary>
+    public enum LinkableProvider
+    {
+        Steam,
+        Discord,
+        Epic,
+    }
+
+    /// <summary>
+    /// Returned by LinkAccountAsync: the refreshed session for the same user and the provider identity
+    /// that was linked to it.
+    /// </summary>
+    public sealed class LinkAccountResult
+    {
+        internal LinkAccountResult(Auth4Session session, LinkedIdentity identity)
+        {
+            Session = session;
+            Identity = identity;
+        }
+
+        public Auth4Session Session { get; }
+
+        public LinkedIdentity Identity { get; }
+    }
+
+    /// <summary>
+    /// The player's public display name (AUTH4D-324). Name, Discriminator and Tag are all null until a
+    /// name is set. Tag ("Name#1234") is unique in the project.
+    /// </summary>
+    public sealed class PlayerName
+    {
+        internal PlayerName(string name, string discriminator)
+        {
+            Name = name;
+            Discriminator = discriminator;
+            Tag = name == null ? null : name + "#" + discriminator;
+        }
+
+        /// <summary>The name as stored: trimmed and NFC normalised.</summary>
+        public string Name { get; }
+
+        /// <summary>Four digits assigned by the server, such as "0427".</summary>
+        public string Discriminator { get; }
+
+        public string Tag { get; }
+
+        public bool IsSet => Name != null;
+    }
+
+    /// <summary>Returned by UnlinkAccountAsync: the refreshed session for the same user.</summary>
+    public sealed class UnlinkAccountResult
+    {
+        internal UnlinkAccountResult(Auth4Session session)
+        {
+            Session = session;
+        }
+
+        public Auth4Session Session { get; }
+    }
+
     public sealed class GuestUpgradeResult
     {
         internal GuestUpgradeResult(Auth4Session session, LinkedIdentity identity)
@@ -262,5 +327,38 @@ namespace Auth4
         public Auth4Session Session { get; }
 
         public LinkedIdentity Identity { get; }
+    }
+    /// <summary>
+    /// A Game Center sign-in waiting for the verified email step (AUTH4D-311). The continuation is a
+    /// one-time secret held in memory only; it is never shown to the player or logged.
+    /// </summary>
+    public sealed class GameCenterEmailContinuation
+    {
+        internal GameCenterEmailContinuation(
+            string value,
+            DateTimeOffset expiresAt,
+            string guestUserId,
+            string guestSessionId,
+            int generation)
+        {
+            Generation = generation;
+            Value = value;
+            ExpiresAt = expiresAt;
+            GuestUserId = guestUserId;
+            GuestSessionId = guestSessionId;
+        }
+
+        internal string Value { get; }
+
+        /// <summary>The sign-out generation in which the Game Center sign-in began.</summary>
+        internal int Generation { get; }
+
+        /// <summary>When the step expires; sign in with Game Center again after this time.</summary>
+        public DateTimeOffset ExpiresAt { get; }
+
+        /// <summary>The guest being linked, or null for a plain sign-in.</summary>
+        public string GuestUserId { get; }
+
+        internal string GuestSessionId { get; }
     }
 }

@@ -69,6 +69,8 @@ export const IdentityProviderSchema = z.enum([
    * provider's subject>`.
    */
   "sso",
+  /** AUTH4D-311: an Apple Game Center player; the subject is the signed player id, no email. */
+  "game_center",
 ]);
 
 /**
@@ -206,6 +208,8 @@ export const IdpSchema = z.enum([
   "sso",
   "guest",
   "session",
+  // AUTH4D-311
+  "game_center",
 ]);
 export type Idp = z.infer<typeof IdpSchema>;
 /**
@@ -213,6 +217,14 @@ export type Idp = z.infer<typeof IdpSchema>;
  * refuse the token. Issuers only emit IdpSchema values.
  */
 export const IdpClaimSchema = z.string().regex(/^[a-z][a-z0-9_]{1,31}$/);
+
+/**
+ * AUTH4D-324: the player's public name and discriminator, `Name#1234` (player-names.ts has the
+ * full name rules). Access tokens carry it only with the `profile` scope and only when the project
+ * turns it on; userinfo returns it with the `profile` scope.
+ */
+export const NAME_CLAIM = "name" as const;
+export const NameClaimSchema = z.string().regex(/^[^\p{White_Space}\p{Z}\p{C}#]{1,32}#[0-9]{4}$/u);
 
 export const TokenAudienceSchema = z.string().min(1).max(255);
 /** Shared by access and ID tokens; index.ts extends it for IdTokenClaimsSchema. */
@@ -242,6 +254,8 @@ export const AccessTokenClaimsSchema = JwtBaseSchema.extend({
   auth4_meta: MetadataClaimSchema.optional(),
   /** AUTH4D-258: the sign-in method (IdpSchema). ID tokens and userinfo carry it; absent is fine. */
   idp: IdpClaimSchema.optional(),
+  /** NAME_CLAIM (AUTH4D-324): the player's `Name#1234`. Absent means none or not turned on. */
+  name: NameClaimSchema.optional(),
 }).superRefine((claims, ctx) => {
   if (!issuerMatchesTenant(claims.iss, claims.tenant_id)) {
     ctx.addIssue({

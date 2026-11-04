@@ -756,3 +756,107 @@ describe("AUTH4D-231 configuration", () => {
     expect(issuer.requests[0]).toBe(`${ISSUER}/.well-known/openid-configuration`);
   });
 });
+
+describe("AUTH4D-365 bounded pending transactions", () => {
+  const cookieBytes = (browser: Browser, path: string) =>
+    browser.request(path).headers.get("cookie")?.length ?? 0;
+
+  it("keeps abandoned logins under the budget and every cookie under 4096 bytes", async () => {
+    const { auth4, issuer } = setup();
+    const browser = new Browser();
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      const { response } = await startLogin(auth4, browser, issuer);
+      for (const header of response.headers.getSetCookie()) {
+        expect(header.length).toBeLessThan(4_096);
+      }
+      expect(cookieBytes(browser, "/auth/callback")).toBeLessThanOrEqual(3_500 + 120);
+    }
+    expect(browser.names().filter((name) => name.startsWith("auth4_tx_")).length).toBeLessThan(10);
+  });
+
+  it("falls back to the root for oversized return destinations", async () => {
+    const { auth4, issuer } = setup();
+    const browser = new Browser();
+    const { response, state } = await startLogin(
+      auth4,
+      browser,
+      issuer,
+      `?returnTo=${encodeURIComponent(`/a?x=${"y".repeat(6_000)}`)}`,
+    );
+    for (const header of response.headers.getSetCookie()) {
+      expect(header.length).toBeLessThan(4_096);
+    }
+    const callback = await auth4.middleware(
+      browser.request(`/auth/callback?code=c&state=${state}&iss=${encodeURIComponent(ISSUER)}`),
+    );
+    expect(callback.headers.get("Location")).toBe(`${APP}/`);
+  });
+
+  it("completes two concurrent sign-ins independently", async () => {
+    const { auth4, issuer } = setup();
+    const browser = new Browser();
+    const first = await startLogin(auth4, browser, issuer);
+    const second = await startLogin(auth4, browser, issuer);
+    const nonceSecond = issuer.nonce;
+    const callback = await auth4.middleware(
+      browser.request(
+        `/auth/callback?code=c&state=${second.state}&iss=${encodeURIComponent(ISSUER)}`,
+      ),
+    );
+    expect(callback.status).toBe(302);
+    browser.store(callback);
+    expect(nonceSecond).toBeTruthy();
+    issuer.nonce = first.location.searchParams.get("nonce")!;
+    const other = await auth4.middleware(
+      browser.request(
+        `/auth/callback?code=c&state=${first.state}&iss=${encodeURIComponent(ISSUER)}`,
+      ),
+    );
+    expect(other.status).toBe(302);
+    browser.store(other);
+    expect(browser.names()).toEqual(["auth4_session"]);
+  });
+
+  it("fails safely for an evicted attempt while newer ones still work", async () => {
+    const { auth4, issuer } = setup();
+    const browser = new Browser();
+    const first = await startLogin(auth4, browser, issuer);
+    let last = first;
+    for (let attempt = 0; attempt < 30; attempt += 1)
+      last = await startLogin(auth4, browser, issuer);
+    const evicted = await auth4.middleware(
+      browser.request(`/auth/callback?code=c&state=${first.state}`),
+    );
+    expect(evicted.status).toBe(400);
+    const ok = await auth4.middleware(
+      browser.request(
+        `/auth/callback?code=c&state=${last.state}&iss=${encodeURIComponent(ISSUER)}`,
+      ),
+    );
+    expect(ok.status).toBe(302);
+  });
+
+  it("bounds hosted logout attempts and cleans legacy cookies at the callback", async () => {
+    const { auth4, issuer } = setup({ hostedLogout: true });
+    const browser = new Browser();
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      browser.store(await auth4.middleware(browser.request("/auth/logout")));
+    }
+    expect(cookieBytes(browser, "/auth/callback")).toBeLessThanOrEqual(3_500 + 120);
+    // Legacy cookies from earlier versions that cannot be opened are removed at the callback.
+    browser.jar.set(`auth4_tx_${"L".repeat(43)}`, { value: "garbage", path: "/auth/callback" });
+    const { state } = await startLogin(auth4, browser, issuer);
+    const callback = await auth4.middleware(
+      browser.request(`/auth/callback?code=c&state=${state}&iss=${encodeURIComponent(ISSUER)}`),
+    );
+    browser.store(callback);
+    expect(browser.names().some((name) => name.includes("LLLL"))).toBe(false);
+  });
+
+  it("rejects a transactions budget that is too small", () => {
+    const { auth4 } = setup({ transactions: { maxBytes: 100 } });
+    return expect(
+      auth4.middleware(new NextRequest(new URL("/auth/login", APP))),
+    ).rejects.toBeInstanceOf(ConfigurationError);
+  });
+});

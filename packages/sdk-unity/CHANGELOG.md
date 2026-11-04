@@ -1,5 +1,51 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `GetPlayerNameAsync` and `UpdatePlayerNameAsync` read and set the player's display name
+  (AUTH4D-324). They return a `PlayerName` with `Name`, the server-assigned four-digit
+  `Discriminator`, `Tag` (`Name#1234`) and `IsSet`.
+- `AddEmailFailure.LoginRequired` and `LinkAccountFailure.LoginRequired` (AUTH4D-343): adding,
+  changing or removing an email address, and linking or unlinking an account, need a sign-in from
+  the last five minutes.
+
+### Fixed
+
+- `TryRestoreSessionAsync` (AUTH4D-354) reports success only after a refresh returned a usable
+  access token. A transient failure keeps the stored credential, leaves `CurrentSession` null and
+  is retried by the next call; concurrent callers share one refresh outcome; `invalid_grant`
+  clears the credential and returns `false`; a sign-out during a pending restore wins.
+- Guest, device and fresh Game Center sign-ins (including the Game Center email continuation) are
+  bound to the sign-out generation in which they began (AUTH4D-400). A result that arrives after
+  `SignOutAsync` no longer creates a session, saves credentials or raises `SessionChanged`; the
+  returned credentials are revoked on a best-effort basis and the call throws
+  `InvalidOperationException`. A sign-in started after sign-out is unaffected.
+- `UpgradeGuestAsync(provider)` puts the provider hint before the page URI's fragment, which now
+  carries the browser verifier (AUTH4D-343).
+
+## [0.8.0] - 2026-10-22
+
+### Added
+
+- `SignInWithGameCenterAsync` signs the player in with Apple Game Center on iOS and macOS, through
+  a new `IAuth4GameCenter` adapter (`Auth4ClientOptions.GameCenter`) that returns GameKit's identity
+  verification signature as a `GameCenterIdentity`. With a guest signed in, it links the Game
+  Center player to the guest and replaces the guest session.
+- `Auth4EmailVerificationRequiredException`, `SendGameCenterEmailCodeAsync` and
+  `ConfirmGameCenterEmailCodeAsync` finish the verified email step in game when the application
+  requires an email address.
+- The **Game Center Sign-In** sample, with an adapter built on Apple's GameKit plug-in for Unity.
+- `LinkAccountAsync(LinkableProvider)` lets a signed-in player link a Steam, Discord or Epic Games
+  account (AUTH4D-308). It opens the hosted `/login/link-account` page with the `BrowserLauncher`,
+  polls while the player signs in with the provider and confirms, and then replaces the session
+  with a refreshed one for the same user and raises `SessionChanged`. It returns
+  `LinkAccountResult` with the session and the linked identity.
+- `UnlinkAccountAsync(LinkableProvider)` unlinks one through the same page and returns
+  `UnlinkAccountResult`. Failures of both throw `Auth4LinkAccountException` with a
+  `LinkAccountFailure` reason.
+
 ## [0.7.0] - 2026-10-14
 
 ### Added

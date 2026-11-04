@@ -24,5 +24,16 @@ if (result.status === "signed_out") await auth4.login(); // navigates to hosted 
 
 The package is ES2022 JavaScript with TypeScript declarations and has no runtime dependencies.
 
+Games running as Discord Activities can sign in with the code from Discord's `authorize()` command
+instead: `auth4.signInWithDiscordActivity({ code })`. See the
+[Discord Activities guide](https://auth4.dev/docs/discord-activities/).
+
 See the [browser quickstart](https://auth4.dev/docs/browser/) for the full guide, and
 [limitations](https://auth4.dev/docs/limitations/) for what isn't supported yet.
+
+## Signing keys
+
+ID tokens are checked against the issuer's JWKS, cached for its `Cache-Control` max-age. If a token
+names a key id missing from a still-fresh cache, the SDK refetches the JWKS once from the
+discovered `jwks_uri` (concurrent checks share that fetch, and repeats are limited to one per
+30 seconds). Unknown or ambiguous keys and bad signatures are still rejected.

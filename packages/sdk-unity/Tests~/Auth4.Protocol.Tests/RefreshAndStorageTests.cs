@@ -212,6 +212,51 @@ namespace Auth4.Protocol.Tests
         }
 
         [Test]
+        public async Task FailedInitialWriteReportsNotPersistentButSessionStaysUsable()
+        {
+            var server = new RotatingServer();
+            var storage = new FakeSecureStorage { FailWrites = true, FailDeletes = true };
+            var client = Client(server.Transport(), new FakeClock(), storage);
+            Auth4Session changed = null;
+            client.SessionChanged += session => changed = session;
+
+            var session = await client.SignInAsGuestAsync();
+
+            Assert.That(session.IsRefreshPersistent, Is.False);
+            Assert.That(client.CurrentSession.IsRefreshPersistent, Is.False);
+            Assert.That(changed.IsRefreshPersistent, Is.False);
+            Assert.That(client.IsRefreshPersistent, Is.False);
+            Assert.That(client.CurrentSession.CanRefresh, Is.True);
+            Assert.That(await client.GetAccessTokenAsync(), Is.EqualTo(Token("access-0")));
+        }
+
+        [Test]
+        public async Task FailedRotationWriteDropsPersistenceAndLaterWriteRestoresIt()
+        {
+            var server = new RotatingServer();
+            var storage = new FakeSecureStorage();
+            var clock = new FakeClock();
+            var client = Client(server.Transport(), clock, storage);
+            var changes = new System.Collections.Generic.List<Auth4Session>();
+            client.SessionChanged += changes.Add;
+            Assert.That((await client.SignInAsGuestAsync()).IsRefreshPersistent, Is.True);
+
+            storage.FailWrites = true;
+            await client.RefreshAsync();
+            Assert.That(client.CurrentSession.IsRefreshPersistent, Is.False);
+            Assert.That(changes.Last().IsRefreshPersistent, Is.False);
+            Assert.That(storage.Values, Is.Empty);
+            Assert.That(await client.GetAccessTokenAsync(), Is.EqualTo(Token("access-1")));
+
+            storage.FailWrites = false;
+            await client.RefreshAsync();
+            Assert.That(client.CurrentSession.IsRefreshPersistent, Is.True);
+            Assert.That(changes.Last().IsRefreshPersistent, Is.True);
+            Assert.That(client.IsRefreshPersistent, Is.True);
+            Assert.That(storage.Values.Values.Single(), Does.Contain(Token("refresh-2")));
+        }
+
+        [Test]
         public async Task SecureAdapterRestoresGuestAcrossRestart()
         {
             var server = new RotatingServer();
@@ -243,6 +288,126 @@ namespace Auth4.Protocol.Tests
             var restarted = Client(server.Transport(), new FakeClock(), storage);
             Assert.That(await restarted.TryRestoreSessionAsync(), Is.False);
             Assert.That(storage.Values, Is.Empty);
+        }
+
+        [Test]
+        public async Task RestoreAfterTransientFailureRetriesRefreshAndKeepsCredential()
+        {
+            var server = new RotatingServer();
+            var storage = new FakeSecureStorage();
+            await Client(server.Transport(), new FakeClock(), storage).SignInAsGuestAsync();
+            var transport = server.Transport();
+            var restarted = Client(transport, new FakeClock(), storage);
+            server.RejectWith = "temporarily_unavailable";
+
+            Assert.ThrowsAsync<Auth4Exception>(() => restarted.TryRestoreSessionAsync());
+            Assert.That(restarted.CurrentSession, Is.Null);
+            Assert.That(storage.Values.Values.Single(), Does.Contain(Token("refresh-0")));
+
+            server.RejectWith = null;
+            Assert.That(await restarted.TryRestoreSessionAsync(), Is.True);
+            Assert.That(await restarted.GetAccessTokenAsync(), Is.EqualTo(Token("access-1")));
+            Assert.That(transport.To("/oauth/token").Count(), Is.EqualTo(2));
+            Assert.That(storage.Values.Values.Single(), Does.Contain(Token("refresh-1")));
+        }
+
+        [Test]
+        public async Task ConcurrentRestoreCallersShareOneRefreshOutcome()
+        {
+            var server = new RotatingServer();
+            var storage = new FakeSecureStorage();
+            await Client(server.Transport(), new FakeClock(), storage).SignInAsGuestAsync();
+            server.Gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var transport = server.Transport();
+            var restarted = Client(transport, new FakeClock(), storage);
+
+            var callers = Enumerable.Range(0, 5).Select(_ => restarted.TryRestoreSessionAsync()).ToList();
+            Assert.That(callers.Any(caller => caller.IsCompleted), Is.False);
+            Assert.That(restarted.CurrentSession, Is.Null);
+            server.Gate.SetResult(true);
+
+            Assert.That(await Task.WhenAll(callers), Is.All.True);
+            Assert.That(transport.To("/oauth/token").Count(), Is.EqualTo(1));
+            Assert.That(await restarted.GetAccessTokenAsync(), Is.EqualTo(Token("access-1")));
+        }
+
+        [Test]
+        public async Task ConcurrentRestoreCallersAllSeeRevokedCredential()
+        {
+            var server = new RotatingServer();
+            var storage = new FakeSecureStorage();
+            await Client(server.Transport(), new FakeClock(), storage).SignInAsGuestAsync();
+            server.Gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            server.RejectWith = "invalid_grant";
+            var restarted = Client(server.Transport(), new FakeClock(), storage);
+
+            var callers = Enumerable.Range(0, 3).Select(_ => restarted.TryRestoreSessionAsync()).ToList();
+            server.Gate.SetResult(true);
+
+            Assert.That(await Task.WhenAll(callers), Is.All.False);
+            Assert.That(storage.Values, Is.Empty);
+            Assert.That(restarted.CurrentSession, Is.Null);
+        }
+
+        [Test]
+        public async Task CancellingARestoreCallerDoesNotAbandonTheSharedRefresh()
+        {
+            var server = new RotatingServer();
+            var storage = new FakeSecureStorage();
+            await Client(server.Transport(), new FakeClock(), storage).SignInAsGuestAsync();
+            server.Gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var restarted = Client(server.Transport(), new FakeClock(), storage);
+            using (var cts = new CancellationTokenSource())
+            {
+                var cancelled = restarted.TryRestoreSessionAsync(cts.Token);
+                var patient = restarted.TryRestoreSessionAsync();
+                cts.Cancel();
+                Assert.ThrowsAsync<OperationCanceledException>(async () => await cancelled);
+                server.Gate.SetResult(true);
+                Assert.That(await patient, Is.True);
+            }
+
+            Assert.That(await restarted.GetAccessTokenAsync(), Is.EqualTo(Token("access-1")));
+        }
+
+        [Test]
+        public async Task SignOutWhileRestoreRefreshIsPendingCannotResurrectTheSession()
+        {
+            var server = new RotatingServer();
+            var storage = new FakeSecureStorage();
+            await Client(server.Transport(), new FakeClock(), storage).SignInAsGuestAsync();
+            server.Gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var transport = server.Transport();
+            var restarted = Client(transport, new FakeClock(), storage);
+
+            var restore = restarted.TryRestoreSessionAsync();
+            while (!transport.To("/oauth/token").Any())
+            {
+                await Task.Delay(1);
+            }
+
+            var signOut = restarted.SignOutAsync();
+            server.Gate.SetResult(true);
+            await signOut;
+            await restore;
+
+            Assert.That(restarted.CurrentSession, Is.Null);
+            Assert.That(storage.Values, Is.Empty);
+            Assert.ThrowsAsync<Auth4Exception>(() => restarted.GetAccessTokenAsync());
+        }
+
+        [Test]
+        public async Task RestoreAfterSignOutDoesNotRefreshAgain()
+        {
+            var server = new RotatingServer();
+            var storage = new FakeSecureStorage();
+            var transport = server.Transport();
+            var client = Client(transport, new FakeClock(), storage);
+            await client.SignInAsGuestAsync();
+            await client.SignOutAsync();
+
+            Assert.That(await client.TryRestoreSessionAsync(), Is.False);
+            Assert.That(transport.To("/oauth/token"), Is.Empty);
         }
 
         [Test]

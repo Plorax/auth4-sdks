@@ -124,6 +124,7 @@ namespace Auth4.Protocol.Tests
         [TestCase("guest_account", AddEmailFailure.GuestAccount)]
         [TestCase("email_not_added", AddEmailFailure.NotAdded)]
         [TestCase("email_sign_in_disabled", AddEmailFailure.EmailSignInDisabled)]
+        [TestCase("login_required", AddEmailFailure.LoginRequired)]
         public async Task RefusalsAtCreationAreTypedAndOpenNothing(string error, AddEmailFailure reason)
         {
             var browser = new FakeBrowser();

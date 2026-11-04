@@ -26,9 +26,14 @@ namespace Auth4
         private static readonly Regex TenantIdPattern = new Regex("^ten_[A-Za-z0-9]{16,64}$");
         private static readonly Regex ClientIdPattern = new Regex("^cli_[A-Za-z0-9]{16,64}$");
         private static readonly Regex IntentHandlePattern = new Regex("^gui_[A-Za-z0-9_-]{32,64}$");
+        private static readonly Regex DiscriminatorPattern = new Regex("^[0-9]{4}$");
         private static readonly Regex PollSecretPattern = new Regex("^gps_[A-Za-z0-9_-]{43,86}$");
         private static readonly Regex AddEmailIntentPattern = new Regex("^aei_[A-Za-z0-9_-]{32,64}$");
         private static readonly Regex AddEmailSecretPattern = new Regex("^aep_[A-Za-z0-9_-]{43,86}$");
+        private static readonly Regex GameCenterContinuationPattern = new Regex("^gcc_[A-Za-z0-9_-]{43}$");
+        private static readonly Regex LinkAccountIntentPattern = new Regex("^lai_[A-Za-z0-9_-]{32,64}$");
+        private static readonly Regex LinkAccountSecretPattern = new Regex("^lap_[A-Za-z0-9_-]{43,86}$");
+        private const string LinkAccountPagePath = "/login/link-account";
 
         private readonly object _sync = new object();
         private readonly SemaphoreSlim _gate = new SemaphoreSlim(1, 1);
@@ -42,9 +47,11 @@ namespace Auth4
         private readonly int _maxTransientFailures;
         private readonly IAuth4BrowserLauncher _browserLauncher;
         private readonly IAuth4UpgradeWindow _upgradeWindow;
+        private readonly IAuth4GameCenter _gameCenter;
 
         private TokenState _state;
         private Task<Auth4Session> _refreshInFlight;
+        private Task<bool> _restoreInFlight;
         private int _upgradeInFlight;
         private WindowUpgrade _windowUpgrade;
         private int _signOutGeneration;
@@ -88,6 +95,7 @@ namespace Auth4
             _maxTransientFailures = options.MaxConsecutiveTransientPollFailures;
             _browserLauncher = options.BrowserLauncher;
             _upgradeWindow = options.UpgradeWindow;
+            _gameCenter = options.GameCenter;
         }
 
         /// <summary>Raised after sign-in, refresh, upgrade or sign-out. The argument is null when signed out.</summary>
@@ -101,8 +109,21 @@ namespace Auth4
 
         public string DefaultScope { get; }
 
-        /// <summary>True only when a secure storage adapter was supplied.</summary>
-        public bool IsRefreshPersistent => _storage.IsPersistent;
+        /// <summary>
+        /// With a signed-in session: true only when its current refresh credential was saved to secure storage
+        /// (a failed write makes it false until a later write succeeds). Without a session: whether a secure
+        /// storage adapter was supplied.
+        /// </summary>
+        public bool IsRefreshPersistent
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    return _state != null ? _state.ToSession().IsRefreshPersistent : _storage.IsPersistent;
+                }
+            }
+        }
 
         public Auth4Session CurrentSession
         {
@@ -110,7 +131,8 @@ namespace Auth4
             {
                 lock (_sync)
                 {
-                    return _state?.ToSession(_storage.IsPersistent);
+                    // A refresh-only state is an incomplete restoration, not a usable session.
+                    return _state?.AccessToken != null ? _state.ToSession() : null;
                 }
             }
         }
@@ -122,6 +144,7 @@ namespace Auth4
             CancellationToken cancellationToken = default)
         {
             EnsureSignedOut();
+            var generation = Volatile.Read(ref _signOutGeneration);
             var requestedScope = scope == null ? DefaultScope : NormalizeScope(scope);
             var response = await SendAsync(
                 FormRequest(Endpoint("/device/authorization?tenant_id=" + Escape(TenantId)), new Dictionary<string, string>
@@ -157,7 +180,8 @@ namespace Auth4
                 verificationUriComplete,
                 _clock.UtcNow.AddSeconds(expiresIn.Value),
                 Math.Max(MinimumPollIntervalSeconds, (int)Math.Ceiling(interval)),
-                requestedScope);
+                requestedScope,
+                generation);
         }
 
         /// <summary>
@@ -229,7 +253,7 @@ namespace Auth4
                     {
                         var tokens = ReadTokens(response, json);
                         completed = true;
-                        return await AdoptNewSessionAsync(tokens);
+                        return await AdoptNewSessionAsync(tokens, authorization.Generation);
                     }
 
                     var failure = ErrorFrom(response, json);
@@ -252,6 +276,12 @@ namespace Auth4
                             completed = true;
                             throw new Auth4DeviceAuthorizationException(
                                 DeviceAuthorizationFailure.Expired,
+                                failure.Error,
+                                response.StatusCode);
+                        case "account_suspended":
+                            completed = true;
+                            throw new Auth4DeviceAuthorizationException(
+                                DeviceAuthorizationFailure.Suspended,
                                 failure.Error,
                                 response.StatusCode);
                     }
@@ -295,6 +325,7 @@ namespace Auth4
         public async Task<Auth4Session> SignInAsGuestAsync(CancellationToken cancellationToken = default)
         {
             EnsureSignedOut();
+            var generation = Volatile.Read(ref _signOutGeneration);
             var response = await SendAsync(
                 JsonRequest(GuestEndpoint(string.Empty), new Dictionary<string, string>
                 {
@@ -317,7 +348,7 @@ namespace Auth4
             var tokens = ReadTokens(response, json);
             tokens.UserId = userId;
             tokens.IsGuest = true;
-            return await AdoptNewSessionAsync(tokens);
+            return await AdoptNewSessionAsync(tokens, generation);
         }
 
         /// <summary>
@@ -620,6 +651,171 @@ namespace Auth4
             return new RemoveEmailResult(outcome.Session);
         }
 
+        /// <summary>
+        /// Lets a signed-in player link a Steam, Discord or Epic Games account to their account
+        /// (AUTH4D-308), so either sign-in reaches the same user. It creates a link request with the
+        /// current access token, opens the hosted link-account page with the BrowserLauncher, where the
+        /// player signs in with the provider and confirms, and polls like AddEmailAsync. The session is
+        /// then replaced with a refreshed one for the same user, and SessionChanged is raised.
+        ///
+        /// Failures that end the request throw Auth4LinkAccountException (GuestAccount, AlreadyLinked,
+        /// ProviderDisabled, Expired, Denied or Cancelled). A provider account that already belongs to
+        /// another user is refused on the page, which lets the player try a different one. Without a
+        /// supported BrowserLauncher it throws PlatformNotSupportedException.
+        /// </summary>
+        public async Task<LinkAccountResult> LinkAccountAsync(
+            LinkableProvider provider,
+            Action<GuestUpgradeProgress> onProgress = null,
+            CancellationToken cancellationToken = default)
+        {
+            var outcome = await AccountLinkAsync("link", provider, onProgress, cancellationToken);
+            return new LinkAccountResult(outcome.Session, outcome.Identity);
+        }
+
+        /// <summary>
+        /// Lets a signed-in player unlink a Steam, Discord or Epic Games account (AUTH4D-308). It opens
+        /// the hosted link-account page, where the player confirms, and polls like LinkAccountAsync. The
+        /// session is then replaced with a refreshed one for the same user, and SessionChanged is raised.
+        ///
+        /// Failures that end the request throw Auth4LinkAccountException (GuestAccount, NotLinked,
+        /// OnlySignInMethod, Expired, Denied or Cancelled). OnlySignInMethod means the provider account
+        /// is the only way the player can sign in, so it cannot be unlinked. Without a supported
+        /// BrowserLauncher it throws PlatformNotSupportedException.
+        /// </summary>
+        public async Task<UnlinkAccountResult> UnlinkAccountAsync(
+            LinkableProvider provider,
+            Action<GuestUpgradeProgress> onProgress = null,
+            CancellationToken cancellationToken = default)
+        {
+            var outcome = await AccountLinkAsync("unlink", provider, onProgress, cancellationToken);
+            return new UnlinkAccountResult(outcome.Session);
+        }
+
+        /// <summary>
+        /// Reads the signed-in player's display name (AUTH4D-324), like Unity Authentication's
+        /// GetPlayerNameAsync. PlayerName.IsSet is false until a name is set.
+        ///
+        /// Throws Auth4Exception: "login_required" with no session, "invalid_token" when the session
+        /// has ended, or a transient error that is safe to retry.
+        /// </summary>
+        public Task<PlayerName> GetPlayerNameAsync(CancellationToken cancellationToken = default)
+        {
+            return PlayerNameCoreAsync("GET", null, false, cancellationToken);
+        }
+
+        /// <summary>
+        /// Sets the signed-in player's display name (AUTH4D-324), like Unity Authentication's
+        /// UpdatePlayerNameAsync. The server trims and normalises it and assigns the four-digit
+        /// discriminator; keeping the same name (ignoring case) keeps the discriminator. Pass null to
+        /// clear the name. Names are 1-32 characters with no spaces, control characters or '#'.
+        ///
+        /// Throws Auth4Exception: "invalid_name" when the name breaks a rule or contains one of the
+        /// project's blocked words (deliberately the same error), "name_unavailable" when no
+        /// discriminator is free, "rate_limited" after too many changes, "login_required" or
+        /// "invalid_token".
+        /// </summary>
+        public Task<PlayerName> UpdatePlayerNameAsync(string name, CancellationToken cancellationToken = default)
+        {
+            return PlayerNameCoreAsync("PUT", name, true, cancellationToken);
+        }
+
+        private async Task<PlayerName> PlayerNameCoreAsync(
+            string method,
+            string name,
+            bool sendBody,
+            CancellationToken cancellationToken)
+        {
+            TokenState current;
+            lock (_sync)
+            {
+                current = _state;
+            }
+
+            if (current == null)
+            {
+                throw new Auth4Exception("login_required", "No session is active.");
+            }
+
+            var accessToken = await GetAccessTokenAsync(cancellationToken);
+            var request = new Auth4HttpRequest(method, Endpoint("/t/" + Escape(TenantId) + "/me/name"));
+            request.Headers["Accept"] = "application/json";
+            request.Headers["Authorization"] = "Bearer " + accessToken;
+            if (sendBody)
+            {
+                request.ContentType = "application/json";
+                request.Body = Encoding.UTF8.GetBytes(Auth4Json.SerializeStrings(new Dictionary<string, string>
+                {
+                    ["name"] = name,
+                }));
+            }
+
+            var response = await SendAsync(request, cancellationToken);
+            var json = Auth4Json.TryParseObject(response.Body);
+            if (response.StatusCode < 200 || response.StatusCode > 299)
+            {
+                throw ErrorFrom(response, json);
+            }
+
+            var storedName = Auth4Json.GetString(json, "name");
+            var discriminator = Auth4Json.GetString(json, "discriminator");
+            var tag = Auth4Json.GetString(json, "tag");
+            var unset = storedName == null && discriminator == null && tag == null;
+            var set = storedName != null && discriminator != null && DiscriminatorPattern.IsMatch(discriminator) &&
+                tag == storedName + "#" + discriminator;
+            if (json == null || (!unset && !set))
+            {
+                throw InvalidResponse(response.StatusCode, "The player name response is malformed.");
+            }
+
+            return new PlayerName(storedName, discriminator);
+        }
+
+        private async Task<EmailActionOutcome> AccountLinkAsync(
+            string action,
+            LinkableProvider provider,
+            Action<GuestUpgradeProgress> onProgress,
+            CancellationToken cancellationToken)
+        {
+            if (_browserLauncher == null || !_browserLauncher.IsSupported)
+            {
+                throw new PlatformNotSupportedException(
+                    (action == "link" ? "LinkAccountAsync" : "UnlinkAccountAsync") + " needs a supported BrowserLauncher.");
+            }
+
+            if (Interlocked.CompareExchange(ref _upgradeInFlight, 1, 0) != 0)
+            {
+                throw new InvalidOperationException("A guest upgrade or account request is already in progress.");
+            }
+
+            try
+            {
+                return await AccountLinkCoreAsync(action, ProviderName(provider), onProgress, cancellationToken);
+            }
+            catch (OperationCanceledException error) when (cancellationToken.IsCancellationRequested)
+            {
+                throw new Auth4LinkAccountException(LinkAccountFailure.Cancelled, "cancelled", 0, error);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _upgradeInFlight, 0);
+            }
+        }
+
+        private static string ProviderName(LinkableProvider provider)
+        {
+            switch (provider)
+            {
+                case LinkableProvider.Steam:
+                    return "steam";
+                case LinkableProvider.Discord:
+                    return "discord";
+                case LinkableProvider.Epic:
+                    return "epic";
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(provider));
+            }
+        }
+
         private async Task<EmailActionOutcome> EmailActionAsync(
             EmailAction action,
             Action<GuestUpgradeProgress> onProgress,
@@ -648,6 +844,233 @@ namespace Auth4
             {
                 Interlocked.Exchange(ref _upgradeInFlight, 0);
             }
+        }
+
+        // ----- Apple Game Center (AUTH4D-311) -----
+
+        /// <summary>
+        /// Signs the player in with Apple Game Center on iOS and macOS. The GameCenter adapter fetches
+        /// GameKit's identity verification signature and the server checks it against Apple's key.
+        /// When signed out, this signs in (creating the account on first use). When a guest is signed
+        /// in, it links the Game Center player to that guest instead: the user ID is kept and the guest
+        /// session is replaced. A player who already has an account is never merged into a guest; that
+        /// fails with identity_in_use and leaves the guest session unchanged.
+        ///
+        /// If the application requires a verified email address, this throws
+        /// Auth4EmailVerificationRequiredException; finish with SendGameCenterEmailCodeAsync and
+        /// ConfirmGameCenterEmailCodeAsync. Without a supported adapter it throws
+        /// PlatformNotSupportedException.
+        /// </summary>
+        public async Task<Auth4Session> SignInWithGameCenterAsync(CancellationToken cancellationToken = default)
+        {
+            if (_gameCenter == null || !_gameCenter.IsSupported)
+            {
+                throw new PlatformNotSupportedException(
+                    "SignInWithGameCenterAsync needs a supported GameCenter adapter (iOS or macOS).");
+            }
+
+            TokenState current;
+            int generation;
+            lock (_sync)
+            {
+                current = _state;
+                generation = Volatile.Read(ref _signOutGeneration);
+            }
+
+            if (current != null && !current.IsGuest)
+            {
+                throw new InvalidOperationException(
+                    "A session is already active. Sign out before signing in with Game Center.");
+            }
+
+            string guestToken = null;
+            if (current != null)
+            {
+                guestToken = await GetAccessTokenAsync(cancellationToken);
+                lock (_sync)
+                {
+                    current = _state;
+                }
+
+                if (current == null || !current.IsGuest)
+                {
+                    throw new InvalidOperationException("The guest session ended before Game Center sign-in.");
+                }
+            }
+
+            var identity = await _gameCenter.FetchIdentityAsync(cancellationToken);
+            if (identity == null)
+            {
+                throw new InvalidOperationException("The GameCenter adapter returned no identity.");
+            }
+
+            var request = new Auth4HttpRequest("POST", GameCenterEndpoint("/token"))
+            {
+                ContentType = "application/json",
+                Body = Encoding.UTF8.GetBytes(Auth4Json.SerializeFields(new Dictionary<string, object>
+                {
+                    ["client_id"] = ClientId,
+                    ["player_id"] = identity.PlayerId,
+                    ["bundle_id"] = identity.BundleId,
+                    ["public_key_url"] = identity.PublicKeyUrl,
+                    ["signature"] = Convert.ToBase64String(identity.Signature),
+                    ["salt"] = Convert.ToBase64String(identity.Salt),
+                    ["timestamp"] = identity.Timestamp,
+                })),
+            };
+            request.Headers["Accept"] = "application/json";
+            if (guestToken != null)
+            {
+                request.Headers["Authorization"] = "Bearer " + guestToken;
+            }
+
+            // A successful link revokes the guest session, so its answer must not be dropped.
+            var response = await SendAsync(request, guestToken == null ? cancellationToken : CancellationToken.None);
+            return await AcceptGameCenterAsync(response, current?.UserId, current?.SessionId, generation);
+        }
+
+        /// <summary>
+        /// Mails a six-digit code to <paramref name="email"/> for a Game Center sign-in that needs a
+        /// verified address. Calling it again replaces the code; the server limits how often.
+        /// </summary>
+        public async Task SendGameCenterEmailCodeAsync(
+            GameCenterEmailContinuation continuation,
+            string email,
+            CancellationToken cancellationToken = default)
+        {
+            EnsureContinuationUsable(continuation);
+            RequireText(email, nameof(email));
+            var response = await SendAsync(
+                JsonRequest(GameCenterEndpoint("/email/send"), new Dictionary<string, string>
+                {
+                    ["client_id"] = ClientId,
+                    ["continuation"] = continuation.Value,
+                    ["email"] = email.Trim(),
+                }),
+                cancellationToken);
+            if (response.StatusCode < 200 || response.StatusCode > 299)
+            {
+                throw ErrorFrom(response, Auth4Json.TryParseObject(response.Body));
+            }
+        }
+
+        /// <summary>
+        /// Confirms the emailed code and finishes the Game Center sign-in (or guest link) with the
+        /// address attached to the account. invalid_code lets the player try again; email_unavailable
+        /// means another account keeps the address, so ask for a different one.
+        /// </summary>
+        public async Task<Auth4Session> ConfirmGameCenterEmailCodeAsync(
+            GameCenterEmailContinuation continuation,
+            string code,
+            CancellationToken cancellationToken = default)
+        {
+            EnsureContinuationUsable(continuation);
+            RequireText(code, nameof(code));
+            var response = await SendAsync(
+                JsonRequest(GameCenterEndpoint("/email/confirm"), new Dictionary<string, string>
+                {
+                    ["client_id"] = ClientId,
+                    ["continuation"] = continuation.Value,
+                    ["code"] = code.Trim(),
+                }),
+                continuation.GuestUserId == null ? cancellationToken : CancellationToken.None);
+            return await AcceptGameCenterAsync(
+                response,
+                continuation.GuestUserId,
+                continuation.GuestSessionId,
+                continuation.Generation);
+        }
+
+        private async Task<Auth4Session> AcceptGameCenterAsync(
+            Auth4HttpResponse response,
+            string guestUserId,
+            string guestSessionId,
+            int generation)
+        {
+            var json = Auth4Json.TryParseObject(response.Body);
+            if (response.StatusCode == 403 && Auth4Json.GetString(json, "error") == "email_verification_required")
+            {
+                var value = Auth4Json.GetString(json, "continuation");
+                var expiresIn = Auth4Json.GetNumber(json, "expires_in");
+                if (value == null || !GameCenterContinuationPattern.IsMatch(value) ||
+                    expiresIn == null || expiresIn <= 0 || expiresIn > 3_600)
+                {
+                    throw InvalidResponse(response.StatusCode, "The email verification response is malformed.");
+                }
+
+                throw new Auth4EmailVerificationRequiredException(
+                    new GameCenterEmailContinuation(
+                        value,
+                        _clock.UtcNow.AddSeconds(expiresIn.Value),
+                        guestUserId,
+                        guestSessionId,
+                        generation),
+                    Auth4Json.GetString(json, "reason"),
+                    response.StatusCode);
+            }
+
+            if (response.StatusCode != 200)
+            {
+                throw ErrorFrom(response, json);
+            }
+
+            var tokens = ReadTokens(response, json);
+            var userId = Auth4Json.GetString(json, "user_id");
+            if (string.IsNullOrEmpty(userId) || (guestUserId != null && userId != guestUserId))
+            {
+                await RevokeQuietlyAsync(tokens.RefreshToken ?? tokens.AccessToken, tokens.RefreshToken != null);
+                throw InvalidResponse(response.StatusCode, "The Game Center response has the wrong user.");
+            }
+
+            tokens.UserId = userId;
+            tokens.IsGuest = false;
+            if (guestUserId == null)
+            {
+                return await AdoptNewSessionAsync(tokens, generation);
+            }
+
+            await _gate.WaitAsync();
+            try
+            {
+                TokenState current;
+                lock (_sync)
+                {
+                    current = _state;
+                }
+
+                // The server already replaced the guest session; keep the replacement only for the
+                // guest that asked for it.
+                if (current == null || !current.IsGuest || current.UserId != guestUserId ||
+                    current.SessionId != guestSessionId)
+                {
+                    await RevokeQuietlyAsync(tokens.RefreshToken ?? tokens.AccessToken, tokens.RefreshToken != null);
+                    throw new InvalidOperationException("The guest session that started this sign-in is no longer active.");
+                }
+
+                return await CommitAsync(tokens);
+            }
+            finally
+            {
+                _gate.Release();
+            }
+        }
+
+        private void EnsureContinuationUsable(GameCenterEmailContinuation continuation)
+        {
+            if (continuation == null)
+            {
+                throw new ArgumentNullException(nameof(continuation));
+            }
+
+            if (_clock.UtcNow >= continuation.ExpiresAt)
+            {
+                throw new Auth4Exception("step_expired", "The email step expired; sign in with Game Center again.");
+            }
+        }
+
+        private Uri GameCenterEndpoint(string suffix)
+        {
+            return Endpoint("/t/" + Escape(TenantId) + "/game-center" + suffix);
         }
 
         // ----- Tokens -----
@@ -716,40 +1139,105 @@ namespace Auth4
             return WaitAsync(shared, cancellationToken);
         }
 
-        /// <summary>Restores a session from secure storage. Returns false when nothing usable is stored.</summary>
-        public async Task<bool> TryRestoreSessionAsync(CancellationToken cancellationToken = default)
+        /// <summary>
+        /// Restores a session from secure storage. Returns true only once a usable access token exists, and
+        /// false when nothing usable is stored or the server rejected the credential (which is then cleared).
+        /// A transient failure throws and keeps the stored credential, so calling again retries the refresh.
+        /// Concurrent callers share one outcome; cancelling stops waiting but not the shared restore.
+        /// </summary>
+        public Task<bool> TryRestoreSessionAsync(CancellationToken cancellationToken = default)
         {
-            await _gate.WaitAsync(cancellationToken);
+            TaskCompletionSource<bool> owner = null;
+            Task<bool> shared;
+            lock (_sync)
+            {
+                if (_state?.AccessToken != null)
+                {
+                    return Task.FromResult(true);
+                }
+
+                if (_restoreInFlight == null)
+                {
+                    owner = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _restoreInFlight = owner.Task;
+                }
+
+                shared = _restoreInFlight;
+            }
+
+            if (owner != null)
+            {
+                _ = RunRestoreAsync(owner);
+            }
+
+            return WaitAsync(shared, cancellationToken);
+        }
+
+        private async Task RunRestoreAsync(TaskCompletionSource<bool> owner)
+        {
             try
+            {
+                var restored = await RestoreCoreAsync();
+                lock (_sync)
+                {
+                    _restoreInFlight = null;
+                }
+
+                owner.SetResult(restored);
+            }
+            catch (Exception error)
             {
                 lock (_sync)
                 {
-                    if (_state != null)
+                    _restoreInFlight = null;
+                }
+
+                owner.SetException(error);
+            }
+        }
+
+        private async Task<bool> RestoreCoreAsync()
+        {
+            var generation = Volatile.Read(ref _signOutGeneration);
+            await _gate.WaitAsync();
+            try
+            {
+                bool refreshOnly;
+                lock (_sync)
+                {
+                    if (_state?.AccessToken != null)
                     {
                         return true;
                     }
+
+                    // A refresh-only state left by a transient failure is retried without reloading.
+                    refreshOnly = _state?.RefreshToken != null;
                 }
 
-                var stored = Auth4Json.TryParseObject(await _storage.LoadAsync(_storageKey, cancellationToken));
-                var refreshToken = Auth4Json.GetString(stored, "refresh_token");
-                if (string.IsNullOrEmpty(refreshToken))
+                if (!refreshOnly)
                 {
-                    if (stored != null)
+                    var stored = Auth4Json.TryParseObject(await _storage.LoadAsync(_storageKey, CancellationToken.None));
+                    var refreshToken = Auth4Json.GetString(stored, "refresh_token");
+                    if (string.IsNullOrEmpty(refreshToken))
                     {
-                        await DeleteStoredQuietlyAsync();
+                        if (stored != null)
+                        {
+                            await DeleteStoredQuietlyAsync();
+                        }
+
+                        return false;
                     }
 
-                    return false;
-                }
-
-                lock (_sync)
-                {
-                    _state = new TokenState
+                    lock (_sync)
                     {
-                        RefreshToken = refreshToken,
-                        UserId = Auth4Json.GetString(stored, "user_id"),
-                        IsGuest = Auth4Json.GetString(stored, "guest") == "true",
-                    };
+                        _state = new TokenState
+                        {
+                            RefreshToken = refreshToken,
+                            UserId = Auth4Json.GetString(stored, "user_id"),
+                            IsGuest = Auth4Json.GetString(stored, "guest") == "true",
+                            IsStored = _storage.IsPersistent,
+                        };
+                    }
                 }
             }
             finally
@@ -759,11 +1247,16 @@ namespace Auth4
 
             try
             {
-                await RefreshAsync(cancellationToken);
-                return true;
+                await RefreshAsync();
+                return Volatile.Read(ref _signOutGeneration) == generation;
             }
             catch (Auth4SessionExpiredException)
             {
+                return false;
+            }
+            catch (Auth4Exception) when (Volatile.Read(ref _signOutGeneration) != generation)
+            {
+                // Signed out while restoring: nothing to restore.
                 return false;
             }
         }
@@ -857,9 +1350,13 @@ namespace Auth4
 
             if (providerHint != null)
             {
+                // AUTH4D-343: the hint joins the query; the verifier stays in the fragment after it.
+                var absolute = upgradeUri.AbsoluteUri;
+                var hash = absolute.IndexOf('#');
                 upgradeUri = new Uri(
-                    upgradeUri.AbsoluteUri + (string.IsNullOrEmpty(upgradeUri.Query) ? "?" : "&") +
-                    "provider=" + providerHint,
+                    (hash < 0 ? absolute : absolute.Substring(0, hash)) +
+                    (string.IsNullOrEmpty(upgradeUri.Query) ? "?" : "&") + "provider=" + providerHint +
+                    (hash < 0 ? "" : absolute.Substring(hash)),
                     UriKind.Absolute);
             }
 
@@ -998,6 +1495,8 @@ namespace Auth4
                         throw new Auth4AddEmailException(AddEmailFailure.NotAdded, refused.Error, response.StatusCode);
                     case "only_sign_in_method":
                         throw new Auth4AddEmailException(AddEmailFailure.OnlySignInMethod, refused.Error, response.StatusCode);
+                    case "login_required":
+                        throw new Auth4AddEmailException(AddEmailFailure.LoginRequired, refused.Error, response.StatusCode);
                 }
 
                 throw refused;
@@ -1159,6 +1658,225 @@ namespace Auth4
                         session,
                         email,
                         new LinkedIdentity(Auth4Json.GetString(identity, "identity_id"), "email"));
+            }
+            finally
+            {
+                _gate.Release();
+            }
+        }
+
+        /// <summary>
+        /// AUTH4D-308: creates the link intent, opens the hosted page and polls, as EmailActionCoreAsync
+        /// does for the add-email intent.
+        /// </summary>
+        private async Task<EmailActionOutcome> AccountLinkCoreAsync(
+            string action,
+            string provider,
+            Action<GuestUpgradeProgress> onProgress,
+            CancellationToken cancellationToken)
+        {
+            var accessToken = await GetAccessTokenAsync(cancellationToken);
+            TokenState current;
+            int generation;
+            lock (_sync)
+            {
+                current = _state;
+                generation = Volatile.Read(ref _signOutGeneration);
+            }
+
+            if (current == null)
+            {
+                throw new Auth4Exception("login_required", "No session is active.");
+            }
+
+            var request = JsonRequest(
+                Endpoint("/t/" + Escape(TenantId) + "/account/link/intent"),
+                new Dictionary<string, string>
+                {
+                    ["client_id"] = ClientId,
+                    ["provider"] = provider,
+                    ["action"] = action,
+                });
+            request.Headers["Authorization"] = "Bearer " + accessToken;
+            var response = await SendAsync(request, cancellationToken);
+            var json = Auth4Json.TryParseObject(response.Body);
+            if (response.StatusCode < 200 || response.StatusCode > 299)
+            {
+                var refused = ErrorFrom(response, json);
+                switch (refused.Error)
+                {
+                    case "guest_account":
+                        throw new Auth4LinkAccountException(LinkAccountFailure.GuestAccount, refused.Error, response.StatusCode);
+                    case "provider_already_linked":
+                        throw new Auth4LinkAccountException(LinkAccountFailure.AlreadyLinked, refused.Error, response.StatusCode);
+                    case "provider_not_linked":
+                        throw new Auth4LinkAccountException(LinkAccountFailure.NotLinked, refused.Error, response.StatusCode);
+                    case "provider_disabled":
+                        throw new Auth4LinkAccountException(LinkAccountFailure.ProviderDisabled, refused.Error, response.StatusCode);
+                    case "only_sign_in_method":
+                        throw new Auth4LinkAccountException(LinkAccountFailure.OnlySignInMethod, refused.Error, response.StatusCode);
+                    case "login_required":
+                        throw new Auth4LinkAccountException(LinkAccountFailure.LoginRequired, refused.Error, response.StatusCode);
+                }
+
+                throw refused;
+            }
+
+            var intent = Auth4Json.GetString(json, "intent");
+            var pollSecret = Auth4Json.GetString(json, "poll_secret");
+            var pageUri = SameOriginUri(Auth4Json.GetString(json, "link_uri"));
+            var expiresIn = Auth4Json.GetNumber(json, "expires_in");
+            var interval = Auth4Json.GetNumber(json, "interval") ?? MinimumPollIntervalSeconds;
+            if (intent == null || !LinkAccountIntentPattern.IsMatch(intent) ||
+                pollSecret == null || !LinkAccountSecretPattern.IsMatch(pollSecret) ||
+                pageUri == null || pageUri.AbsolutePath != LinkAccountPagePath ||
+                expiresIn == null || expiresIn <= 0 || expiresIn > MaxTokenLifetimeSeconds || interval > 3_600)
+            {
+                throw InvalidResponse(response.StatusCode, "The link-account response is malformed.");
+            }
+
+            var expiresAt = _clock.UtcNow.AddSeconds(expiresIn.Value);
+            var pollInterval = PollInterval(interval);
+            ReportProgress(onProgress, new GuestUpgradeProgress(
+                GuestUpgradeStage.OpeningBrowser, pageUri, expiresAt, pollInterval, 0));
+            _browserLauncher.Open(pageUri);
+
+            var transientFailures = 0;
+            for (var attempt = 1; ; attempt++)
+            {
+                ReportProgress(onProgress, new GuestUpgradeProgress(
+                    GuestUpgradeStage.WaitingForPlayer, pageUri, expiresAt, pollInterval, attempt - 1));
+                if (attempt > _maxPollAttempts || _clock.UtcNow >= expiresAt)
+                {
+                    throw new Auth4LinkAccountException(LinkAccountFailure.Expired, "expired_token");
+                }
+
+                await _clock.Delay(TimeSpan.FromSeconds(pollInterval), cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_clock.UtcNow >= expiresAt)
+                {
+                    throw new Auth4LinkAccountException(LinkAccountFailure.Expired, "expired_token");
+                }
+
+                Auth4HttpResponse poll;
+                try
+                {
+                    // Not cancellable once sent: the refreshed session is released exactly once, and the
+                    // previous session has already been revoked when it is.
+                    poll = await SendAsync(
+                        JsonRequest(
+                            Endpoint("/t/" + Escape(TenantId) + "/account/link/intent/token"),
+                            new Dictionary<string, string>
+                            {
+                                ["client_id"] = ClientId,
+                                ["intent"] = intent,
+                                ["poll_secret"] = pollSecret,
+                            }),
+                        CancellationToken.None);
+                }
+                catch (Auth4Exception error) when (error.IsTransient && transientFailures < _maxTransientFailures)
+                {
+                    transientFailures++;
+                    pollInterval = Backoff(pollInterval);
+                    continue;
+                }
+
+                var body = Auth4Json.TryParseObject(poll.Body);
+                if (poll.StatusCode == 200)
+                {
+                    var result = await CommitAccountLinkAsync(action, provider, poll, body, current.UserId, generation);
+                    ReportProgress(onProgress, new GuestUpgradeProgress(
+                        GuestUpgradeStage.Completed, pageUri, expiresAt, pollInterval, attempt));
+                    return result;
+                }
+
+                var failure = ErrorFrom(poll, body);
+                var serverInterval = Auth4Json.GetNumber(body, "interval");
+                switch (failure.Error)
+                {
+                    case "authorization_pending":
+                        transientFailures = 0;
+                        if (serverInterval != null)
+                        {
+                            pollInterval = Math.Max(pollInterval, PollInterval(serverInterval.Value));
+                        }
+
+                        continue;
+                    case "slow_down":
+                        transientFailures = 0;
+                        pollInterval = Math.Max(
+                            pollInterval + SlowDownIncrementSeconds,
+                            serverInterval == null ? 0 : PollInterval(serverInterval.Value));
+                        continue;
+                    case "access_denied":
+                        throw new Auth4LinkAccountException(LinkAccountFailure.Denied, failure.Error, poll.StatusCode);
+                    case "expired_token":
+                        throw new Auth4LinkAccountException(LinkAccountFailure.Expired, failure.Error, poll.StatusCode);
+                }
+
+                if (failure.IsTransient && transientFailures < _maxTransientFailures)
+                {
+                    transientFailures++;
+                    pollInterval = Backoff(pollInterval);
+                    continue;
+                }
+
+                throw failure;
+            }
+        }
+
+        /// <summary>
+        /// Replaces the session with the refreshed one under the gate, as CommitEmailActionAsync does.
+        /// The user must be unchanged; a link result names an identity of the requested provider and an
+        /// unlink result names none.
+        /// </summary>
+        private async Task<EmailActionOutcome> CommitAccountLinkAsync(
+            string action,
+            string provider,
+            Auth4HttpResponse response,
+            Dictionary<string, object> json,
+            string knownUserId,
+            int generation)
+        {
+            var tokens = ReadTokens(response, json);
+            var identity = Auth4Json.GetObject(json, "identity");
+            var userId = Auth4Json.GetString(json, "user_id");
+            await _gate.WaitAsync();
+            try
+            {
+                TokenState current;
+                lock (_sync)
+                {
+                    current = _state;
+                }
+
+                if (Volatile.Read(ref _signOutGeneration) != generation ||
+                    (current != null && knownUserId != null && current.UserId != knownUserId))
+                {
+                    await RevokeQuietlyAsync(tokens.RefreshToken ?? tokens.AccessToken, tokens.RefreshToken != null);
+                    throw new InvalidOperationException("The player signed out before the request finished; sign in again.");
+                }
+
+                var shapeIsValid = action == "unlink"
+                    ? identity == null
+                    : identity != null && Auth4Json.GetString(identity, "provider") == provider &&
+                      !string.IsNullOrEmpty(Auth4Json.GetString(identity, "identity_id"));
+                if (string.IsNullOrEmpty(userId) || (knownUserId != null && userId != knownUserId) || !shapeIsValid)
+                {
+                    await RevokeQuietlyAsync(tokens.RefreshToken ?? tokens.AccessToken, tokens.RefreshToken != null);
+                    await ClearLocalAsync();
+                    throw InvalidResponse(response.StatusCode, "The link-account result did not preserve the user.");
+                }
+
+                tokens.UserId = userId;
+                tokens.IsGuest = false;
+                var session = await CommitAsync(tokens);
+                return action == "unlink"
+                    ? new EmailActionOutcome(session, null, null)
+                    : new EmailActionOutcome(
+                        session,
+                        null,
+                        new LinkedIdentity(Auth4Json.GetString(identity, "identity_id"), provider));
             }
             finally
             {
@@ -1591,7 +2309,7 @@ namespace Auth4
                 }
 
                 var failure = ErrorFrom(response, json);
-                if (failure.Error == "invalid_grant")
+                if (failure.Error == "invalid_grant" || failure.Error == "account_suspended")
                 {
                     await ClearLocalAsync();
                     throw new Auth4SessionExpiredException(failure.Error, failure.Description, failure.StatusCode);
@@ -1605,11 +2323,17 @@ namespace Auth4
             }
         }
 
-        private async Task<Auth4Session> AdoptNewSessionAsync(TokenState tokens)
+        private async Task<Auth4Session> AdoptNewSessionAsync(TokenState tokens, int generation)
         {
             await _gate.WaitAsync();
             try
             {
+                if (Volatile.Read(ref _signOutGeneration) != generation)
+                {
+                    await RevokeQuietlyAsync(tokens.RefreshToken ?? tokens.AccessToken, tokens.RefreshToken != null);
+                    throw new InvalidOperationException("The player signed out before this sign-in finished; sign in again.");
+                }
+
                 bool occupied;
                 lock (_sync)
                 {
@@ -1633,6 +2357,7 @@ namespace Auth4
         /// <summary>Caller holds the gate. Storage writes are not cancellable so the stored and live tokens agree.</summary>
         private async Task<Auth4Session> CommitAsync(TokenState next)
         {
+            var persisted = false;
             try
             {
                 if (next.RefreshToken == null)
@@ -1651,19 +2376,22 @@ namespace Auth4
                             ["guest"] = next.IsGuest ? "true" : "false",
                         }),
                         CancellationToken.None);
+                    persisted = _storage.IsPersistent;
                 }
             }
             catch (Exception)
             {
                 // A stale stored token would be replayed after restart and revoke the family; drop it.
+                // The exception payload is deliberately not kept or logged.
                 await DeleteStoredQuietlyAsync();
             }
 
             Auth4Session session;
             lock (_sync)
             {
+                next.IsStored = persisted;
                 _state = next;
-                session = next.ToSession(_storage.IsPersistent);
+                session = next.ToSession();
             }
 
             RaiseSessionChanged(session);
@@ -2024,8 +2752,12 @@ namespace Auth4
             public string UserId;
             public bool IsGuest;
 
-            public Auth4Session ToSession(bool persistent)
+            /// <summary>True only when the current refresh credential was written to secure storage successfully.</summary>
+            public bool IsStored;
+
+            public Auth4Session ToSession()
             {
+                var persistent = IsStored;
                 return new Auth4Session(
                     UserId,
                     SessionId,

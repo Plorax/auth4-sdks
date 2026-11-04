@@ -399,6 +399,36 @@ describe("Auth4BrowserClient", () => {
     }
   });
 
+  // AUTH4D-310: a banned player gets one error code and nothing about the ban.
+  it("reports a banned player as account_suspended from the callback and the code exchange", async () => {
+    const { client } = makeClient();
+    const flow = await beginFlow(client);
+    const redirected = new URL(redirectUri);
+    redirected.searchParams.set("error", "account_suspended");
+    redirected.searchParams.set("state", flow.state);
+    await expect(client.handleCallback(redirected)).rejects.toMatchObject({
+      code: "account_suspended",
+    });
+
+    const exchange = makeClient({
+      onRequest: (url) => {
+        if (url === `${issuer}/.well-known/openid-configuration`) return jsonResponse(discovery());
+        return new Response(JSON.stringify({ error: "account_suspended" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    }).client;
+    const second = await beginFlow(exchange);
+    const callback = new URL(redirectUri);
+    callback.searchParams.set("code", "code");
+    callback.searchParams.set("state", second.state);
+    await expect(exchange.handleCallback(callback)).rejects.toMatchObject({
+      code: "account_suspended",
+    });
+    expect(exchange.getSession()).toBeNull();
+  });
+
   it("retrieves UserInfo, expires tokens on time, and revokes tokens on logout", async () => {
     let now = fixedNow;
     let revokedForm: URLSearchParams | undefined;
@@ -475,6 +505,7 @@ function refreshHarness(
     now?: () => number;
     refresh?: boolean;
     refreshResponse?: (form: URLSearchParams) => Promise<Response> | Response;
+    userinfo?: () => Promise<Response> | Response;
   } = {},
 ) {
   const now = args.now ?? (() => fixedNow);
@@ -515,6 +546,9 @@ function refreshHarness(
           expires_in: 300,
           id_token: await signIdToken(claims),
         });
+      }
+      if (args.userinfo && url.startsWith("https://auth.auth4.dev/oauth/userinfo")) {
+        return args.userinfo();
       }
       if (url.startsWith("https://auth.auth4.dev/oauth/revoke")) {
         revokeForms.push(form);
@@ -663,6 +697,27 @@ describe("Auth4BrowserClient refresh (AUTH4D-65)", () => {
     expect(client.getSession()).toBeNull();
     expect(client.getAccessToken()).toBeNull();
     await expect(client.getAccessTokenSilently()).resolves.toBeNull();
+  });
+
+  it("ends the session with account_suspended when refresh is refused for a ban", async () => {
+    let now = fixedNow;
+    const { client, signIn } = refreshHarness({
+      now: () => now,
+      refreshResponse: () =>
+        new Response(JSON.stringify({ error: "account_suspended" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }),
+    });
+    const events: unknown[] = [];
+    client.onSessionEvent((event) => events.push(event));
+    await signIn();
+    now += 250_000;
+    await expect(client.getAccessTokenSilently()).rejects.toMatchObject({
+      code: "account_suspended",
+    });
+    expect(events).toEqual([{ type: "signed_out", reason: "refresh_rejected" }]);
+    expect(client.getSession()).toBeNull();
   });
 
   it("signs out when a renewed ID token belongs to another user", async () => {
@@ -1188,5 +1243,120 @@ describe("Auth4BrowserClient idp claim (AUTH4D-270)", () => {
     );
     await session;
     await expect(client.getUser()).resolves.toEqual({ sub: "usr_browserfixture0001" });
+  });
+});
+
+describe("Auth4BrowserClient getUser session binding (AUTH4D-387)", () => {
+  function harness() {
+    let expectedNonce = "";
+    let sub = "usr_playera000000001";
+    const userinfo: Array<(res: Response) => void> = [];
+    const { client } = makeClient({
+      onRequest: async (url) => {
+        if (url === `${issuer}/.well-known/openid-configuration`) return jsonResponse(discovery());
+        if (url === `${issuer}/.well-known/jwks.json`) return jsonResponse({ keys: [publicJwk] });
+        if (url.startsWith("https://auth.auth4.dev/oauth/token")) {
+          return jsonResponse(await tokenBody(expectedNonce, { sub }));
+        }
+        if (url.startsWith("https://auth.auth4.dev/oauth/userinfo")) {
+          return new Promise<Response>((resolve) => userinfo.push(resolve));
+        }
+        return jsonResponse({});
+      },
+    });
+    async function signIn(as: string) {
+      sub = as;
+      const flow = await beginFlow(client);
+      expectedNonce = flow.nonce;
+      const callback = new URL(redirectUri);
+      callback.searchParams.set("code", "code");
+      callback.searchParams.set("state", flow.state);
+      await client.handleCallback(callback);
+    }
+    const requested = async (index: number) => {
+      while (!userinfo[index]) await settle();
+    };
+    const reply = async (index: number, body: Record<string, unknown>) => {
+      await requested(index);
+      userinfo[index]!(jsonResponse(body));
+    };
+    return { client, signIn, reply, requested };
+  }
+
+  const A = "usr_playera000000001";
+  const B = "usr_playerb000000002";
+
+  it("returns the profile for a normal request", async () => {
+    const { client, signIn, reply } = harness();
+    await signIn(A);
+    const pending = client.getUser();
+    await reply(0, { sub: A, name: "Alice" });
+    await expect(pending).resolves.toEqual({ sub: A, name: "Alice" });
+  });
+
+  it("commits a pending response to the renewed token set after a same-session refresh", async () => {
+    let now = fixedNow;
+    let release: (res: Response) => void = () => undefined;
+    const gate = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    const { client, refreshForms, signIn } = refreshHarness({
+      now: () => now,
+      userinfo: () => gate,
+    });
+    await signIn();
+    expect(client.getAccessToken()).toBe("access-token-0");
+    const pending = client.getUser();
+    await settle();
+    now += 250_000; // inside the renewal window, so this really replaces activeTokens
+    await expect(client.getAccessTokenSilently()).resolves.toBe("access-token-1");
+    expect(refreshForms).toHaveLength(1);
+    release(jsonResponse({ sub: "usr_browserfixture0001", name: "Alice" }));
+    await expect(pending).resolves.toEqual({ sub: "usr_browserfixture0001", name: "Alice" });
+    expect(client.getAccessToken()).toBe("access-token-1");
+    expect(client.getSession()?.user).toMatchObject({ name: "Alice" });
+  });
+
+  it("discards a delayed response for A after switching to B", async () => {
+    const { client, signIn, reply, requested } = harness();
+    await signIn(A);
+    const pending = client.getUser();
+    await requested(0);
+    const settled = pending.then(
+      () => "ok",
+      (e: unknown) => e,
+    );
+    await signIn(B);
+    await reply(0, { sub: A, name: "Alice" });
+    const error = (await settled) as Auth4BrowserError;
+    expect(error).toMatchObject({ code: "invalid_session" });
+    expect(error.message).not.toContain("Alice");
+    expect(client.getSession()?.user.sub).toBe(B);
+    expect(client.getSession()?.user).not.toHaveProperty("name");
+  });
+
+  it("discards a delayed response after logout", async () => {
+    const { client, signIn, reply, requested } = harness();
+    await signIn(A);
+    const pending = client.getUser();
+    const settled = expect(pending).rejects.toMatchObject({ code: "invalid_session" });
+    await requested(0);
+    await client.logout();
+    await reply(0, { sub: A, name: "Alice" });
+    await settled;
+    expect(client.getSession()).toBeNull();
+  });
+
+  it("discards a delayed response after logout and signing in again as the same player", async () => {
+    const { client, signIn, reply, requested } = harness();
+    await signIn(A);
+    const pending = client.getUser();
+    const settled = expect(pending).rejects.toMatchObject({ code: "invalid_session" });
+    await requested(0);
+    await client.logout();
+    await signIn(A);
+    await reply(0, { sub: A, name: "Stale" });
+    await settled;
+    expect(client.getSession()?.user).not.toHaveProperty("name");
   });
 });

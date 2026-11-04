@@ -76,6 +76,19 @@ export interface Auth4ClientOptions {
     /** Session cookie name. Default auth4_session. */
     cookieName?: string;
   };
+  /**
+   * Pending sign-in and sign-out attempts. Each attempt keeps one small cookie on the callback path
+   * until it completes, expires or is evicted.
+   */
+  transactions?: {
+    /**
+     * Most bytes (name, value and separators, as in the Cookie header) all pending attempts may
+     * use together. Default 3500. When a new attempt does not fit, the oldest attempts are
+     * dropped; a player who then completes one of those sees the invalid_state error and starts
+     * again. Raise it only if your host accepts larger Cookie headers.
+     */
+    maxBytes?: number;
+  };
   /** Replaces the callback's error page; `code` is one of the SDK's callback error codes. */
   onCallbackError?: (code: CallbackErrorCode, request: NextRequest) => Response | Promise<Response>;
   /** For tests and custom runtimes. */
@@ -141,6 +154,7 @@ interface ResolvedConfig {
   absoluteDuration: number;
   cookieName: string;
   secure: boolean;
+  transactionBudget: number;
   sessionKeys: Uint8Array[];
   transactionKeys: Uint8Array[];
 }
@@ -184,10 +198,23 @@ const REFRESH_LEEWAY_SECONDS = 60;
 const TOUCH_INTERVAL_SECONDS = 300;
 /**
  * A refresh result is reused this long for requests that still carry the old refresh token
- * (parallel requests that left the browser before the new cookie arrived), because presenting a
- * rotated refresh token again counts as reuse and ends the session.
+ * (parallel requests that left the browser before the new cookie arrived). It complements the
+ * server's 30-second reuse window (AUTH4D-304): sharing one result keeps this instance from using
+ * up the window's few sibling tokens, and covers requests that arrive after the window closes,
+ * when presenting a rotated refresh token again counts as reuse and ends the session.
  */
 const REFRESH_REUSE_MS = 60_000;
+/** Return destinations longer than this fall back to the application root. */
+const MAX_RETURN_TO = 1_024;
+const DEFAULT_TRANSACTION_BUDGET = 3_500;
+/** Browsers drop cookies over 4,096 bytes; stay under it including attributes. */
+const MAX_COOKIE_BYTES = 4_000;
+const MAX_PENDING = 16;
+/** Size of one `state:bytes:expiry.` entry in the index cookie. */
+const INDEX_ENTRY_BYTES = 64;
+const TX_PREFIX = "auth4_tx_";
+/** Path=/ index of pending attempts (state:bytes:expiry), so a login can evict callback-path cookies. */
+const TX_INDEX = "auth4_txi";
 const NO_STORE = { "Cache-Control": "no-store" };
 
 function base64Url(bytes: Uint8Array): string {
@@ -354,6 +381,12 @@ export class Auth4Client {
         "session durations must be whole seconds, with absoluteDuration ≥ rollingDuration.",
       );
     }
+    const transactionBudget = options.transactions?.maxBytes ?? DEFAULT_TRANSACTION_BUDGET;
+    if (!Number.isInteger(transactionBudget) || transactionBudget < 1_024) {
+      throw new ConfigurationError(
+        "transactions.maxBytes must be a whole number of at least 1024.",
+      );
+    }
     const scopes = (options.scope ?? "openid profile email").split(/\s+/u).filter(Boolean);
     if (!scopes.includes("openid")) scopes.unshift("openid");
     const refresh = options.refresh === true;
@@ -384,6 +417,7 @@ export class Auth4Client {
       rollingDuration,
       absoluteDuration,
       cookieName,
+      transactionBudget,
       secure: appBase.protocol === "https:",
       sessionKeys: await deriveKeys(secrets, "session"),
       transactionKeys: await deriveKeys(secrets, "transaction"),
@@ -397,6 +431,104 @@ export class Auth4Client {
 
   #cookieOptions(config: ResolvedConfig, maxAge: number, path = "/"): CookieOptions {
     return { httpOnly: true, secure: config.secure, sameSite: "lax", path, maxAge };
+  }
+
+  #readIndex(reader: CookieReader, now: number): { state: string; bytes: number; exp: number }[] {
+    const raw = reader.getAll().find((cookie) => cookie.name === TX_INDEX)?.value ?? "";
+    const entries: { state: string; bytes: number; exp: number }[] = [];
+    for (const part of raw.split(".")) {
+      const [state, bytes, exp] = part.split(":");
+      if (!state || !STATE.test(state)) continue;
+      const entry = { state, bytes: Number(bytes), exp: Number(exp) };
+      if (!Number.isInteger(entry.bytes) || !Number.isInteger(entry.exp)) continue;
+      if (entry.exp > now && entries.length < 2 * MAX_PENDING) entries.push(entry);
+    }
+    return entries;
+  }
+
+  #writeIndex(
+    config: ResolvedConfig,
+    response: NextResponse,
+    entries: { state: string; bytes: number; exp: number }[],
+  ): void {
+    if (entries.length === 0) {
+      response.cookies.set(TX_INDEX, "", this.#cookieOptions(config, 0));
+      return;
+    }
+    const value = entries.map((e) => `${e.state}:${e.bytes}:${e.exp}`).join(".");
+    response.cookies.set(TX_INDEX, value, this.#cookieOptions(config, TRANSACTION_SECONDS));
+  }
+
+  /**
+   * Stores a new pending attempt within the aggregate budget. Cookies on the callback path never
+   * reach the login route, so the Path=/ index lets a login evict the oldest ones by name.
+   * Returns false when the attempt alone cannot fit a cookie.
+   */
+  #storeTransaction(
+    config: ResolvedConfig,
+    request: NextRequest,
+    response: NextResponse,
+    state: string,
+    sealed: string,
+  ): boolean {
+    const name = `${TX_PREFIX}${state}`;
+    // Counts the attempt's own cookie plus its entry in the index cookie, which travels with it.
+    const bytes = name.length + sealed.length + 3 + INDEX_ENTRY_BYTES;
+    const emitted = bytes - INDEX_ENTRY_BYTES + config.routes.callback.length + 64;
+    if (emitted > MAX_COOKIE_BYTES || bytes > config.transactionBudget) return false;
+    const now = this.#seconds();
+    const kept = this.#readIndex(request.cookies, now).filter((entry) => entry.state !== state);
+    kept.push({ state, bytes, exp: now + TRANSACTION_SECONDS });
+    let total = kept.reduce((sum, entry) => sum + entry.bytes, 0);
+    while (kept.length > 1 && (total > config.transactionBudget || kept.length > MAX_PENDING)) {
+      const evicted = kept.shift()!;
+      total -= evicted.bytes;
+      response.cookies.set(
+        `${TX_PREFIX}${evicted.state}`,
+        "",
+        this.#cookieOptions(config, 0, config.routes.callback),
+      );
+    }
+    response.cookies.set(
+      name,
+      sealed,
+      this.#cookieOptions(config, TRANSACTION_SECONDS, config.routes.callback),
+    );
+    this.#writeIndex(config, response, kept);
+    return true;
+  }
+
+  /**
+   * Called on the callback: drops the finished attempt from the index, and removes attempts that
+   * are gone, plus cookies from earlier SDK versions that are expired or cannot be opened.
+   */
+  async #settleTransactions(
+    config: ResolvedConfig,
+    request: NextRequest,
+    response: NextResponse,
+    finished: string | null,
+  ): Promise<void> {
+    const now = this.#seconds();
+    const present = new Set(request.cookies.getAll().map((cookie) => cookie.name));
+    const indexed = this.#readIndex(request.cookies, now);
+    const known = new Set(indexed.map((entry) => entry.state));
+    const kept = indexed.filter(
+      (entry) => entry.state !== finished && present.has(`${TX_PREFIX}${entry.state}`),
+    );
+    for (const cookie of request.cookies.getAll()) {
+      if (!cookie.name.startsWith(TX_PREFIX)) continue;
+      const state = cookie.name.slice(TX_PREFIX.length);
+      if (state === finished || known.has(state)) continue;
+      const opened = await unseal(cookie.value, config.transactionKeys, now);
+      if (!opened) {
+        response.cookies.set(
+          cookie.name,
+          "",
+          this.#cookieOptions(config, 0, config.routes.callback),
+        );
+      }
+    }
+    if (kept.length > 0 || present.has(TX_INDEX)) this.#writeIndex(config, response, kept);
   }
 
   /** Only same-origin destinations; anything else falls back to the application root. */
@@ -419,7 +551,8 @@ export class Auth4Client {
     if (url.origin !== config.appOrigin || url.username !== "" || url.password !== "") {
       return fallback;
     }
-    return url.toString();
+    // A destination this long would make the transaction cookie unusable.
+    return url.toString().length > MAX_RETURN_TO ? fallback : url.toString();
   }
 
   // --- Session cookie ----------------------------------------------------------------------
@@ -521,7 +654,7 @@ export class Auth4Client {
 
   /**
    * Rotates the refresh token. Concurrent and closely following requests carrying the same refresh
-   * token share one call, because auth4.dev treats a second use as theft and ends the session.
+   * token share one call; auth4.dev treats a second use after its 30-second window as theft.
    */
   async #refresh(config: ResolvedConfig, oidc: OidcClient, session: StoredSession) {
     const key = await sha256(session.refreshToken!);
@@ -681,11 +814,9 @@ export class Auth4Client {
 
     const response = NextResponse.redirect(url, { status: 302, headers: NO_STORE });
     // One cookie per attempt, scoped to the callback, so two tabs can sign in at once.
-    response.cookies.set(
-      `auth4_tx_${state}`,
-      sealed,
-      this.#cookieOptions(config, TRANSACTION_SECONDS, config.routes.callback),
-    );
+    if (!this.#storeTransaction(config, request, response, state, sealed)) {
+      return plainResponse(400, "Sign-in could not be started.");
+    }
     return response;
   }
 
@@ -715,12 +846,16 @@ export class Auth4Client {
           this.#cookieOptions(config, 0, config.routes.callback),
         );
       }
+      await this.#settleTransactions(config, request, response, state);
       return response;
     };
 
     // The state must name a transaction this browser started, sealed with this app's secret.
     if (!state || !transaction || transaction.state !== state) return fail("invalid_state");
-    const finish = (response: NextResponse, changes?: CookieChanges): NextResponse => {
+    const finish = async (
+      response: NextResponse,
+      changes?: CookieChanges,
+    ): Promise<NextResponse> => {
       response.headers.set("Cache-Control", "no-store");
       response.cookies.set(
         transactionCookie!,
@@ -728,6 +863,7 @@ export class Auth4Client {
         this.#cookieOptions(config, 0, config.routes.callback),
       );
       changes?.applyTo(response.cookies);
+      await this.#settleTransactions(config, request, response, state);
       return response;
     };
     if (transaction.kind === "logout") {
@@ -809,12 +945,13 @@ export class Auth4Client {
     }
     const response = NextResponse.redirect(target, { status: 302, headers: NO_STORE });
     changes.applyTo(response.cookies);
-    if (transaction && state) {
-      response.cookies.set(
-        `auth4_tx_${state}`,
-        transaction,
-        this.#cookieOptions(config, TRANSACTION_SECONDS, config.routes.callback),
-      );
+    if (
+      transaction &&
+      state &&
+      !this.#storeTransaction(config, request, response, state, transaction)
+    ) {
+      // Signing out already happened; go straight back instead of via the hosted page.
+      response.headers.set("Location", returnTo);
     }
     return response;
   }

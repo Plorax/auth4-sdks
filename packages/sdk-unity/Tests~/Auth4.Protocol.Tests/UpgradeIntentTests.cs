@@ -442,6 +442,25 @@ namespace Auth4.Protocol.Tests
         }
 
         [Test]
+        public async Task KeepsTheVerifierFragmentAfterTheProviderHint()
+        {
+            // AUTH4D-343: the hint joins the query; the verifier stays in the fragment, untouched.
+            var fragment = "#verifier=" + new string('V', 43);
+            var browser = new FakeBrowser();
+            var client = Client(
+                IntentServerWith(
+                    () => FakeTransport.Json(200, IntentCreated(upgradeUri: UpgradeUri + fragment)),
+                    () => FakeTransport.Json(200, Upgraded(provider: "steam"))),
+                new FakeClock(),
+                browser);
+            await client.SignInAsGuestAsync();
+
+            await client.UpgradeGuestAsync(Auth4Provider.Steam);
+
+            Assert.That(browser.Opened.Single().AbsoluteUri, Is.EqualTo(UpgradeUri + "&provider=steam" + fragment));
+        }
+
+        [Test]
         public async Task RejectsAnUndefinedProviderBeforeCreatingAnIntent()
         {
             var browser = new FakeBrowser();

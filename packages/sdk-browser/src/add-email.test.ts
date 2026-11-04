@@ -191,6 +191,14 @@ describe("AUTH4D-149 browser addEmail", () => {
     expect(browser.popup?.closed).toBe(true);
   });
 
+  it("AUTH4D-343: reports a stale sign-in as login_required", async () => {
+    browser.popup = fakePopup();
+    const { client } = makeClient([], { status: 403, body: { error: "login_required" } });
+    await signedIn(client);
+    await expect(client.addEmail()).rejects.toMatchObject({ code: "login_required" });
+    expect(browser.popup?.closed).toBe(true);
+  });
+
   it("reports Not now as cancelled and a closed window as window_closed", async () => {
     const denied = makeClient([{ status: 400, body: { error: "access_denied" } }]);
     await signedIn(denied.client);

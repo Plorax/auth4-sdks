@@ -27,12 +27,21 @@ namespace Auth4
             Error == "temporarily_unavailable" ||
             Error == "server_error" ||
             StatusCode >= 500;
+
+        /// <summary>
+        /// The player has an active ban (account_suspended). Show that the account is suspended;
+        /// the ban's reason is never sent to the game.
+        /// </summary>
+        public bool IsAccountSuspended => Error == "account_suspended";
     }
 
     public enum DeviceAuthorizationFailure
     {
         Denied,
         Expired,
+
+        /// <summary>The player who tried to approve or sign in has an active ban.</summary>
+        Suspended,
     }
 
     /// <summary>The user denied the device, or the device code expired before approval.</summary>
@@ -118,6 +127,11 @@ namespace Auth4
         /// RemoveEmailAsync: the address is the player's only way to sign in, so it cannot be removed.
         /// </summary>
         OnlySignInMethod,
+
+        /// <summary>
+        /// AUTH4D-343: the player signed in more than five minutes ago. Sign them in again, then retry.
+        /// </summary>
+        LoginRequired,
     }
 
     /// <summary>
@@ -136,12 +150,88 @@ namespace Auth4
         public AddEmailFailure Reason { get; }
     }
 
-    /// <summary>The refresh credential was rejected; the local session has been cleared.</summary>
+    public enum LinkAccountFailure
+    {
+        /// <summary>The player is still a guest; save the progress with UpgradeGuestAsync instead.</summary>
+        GuestAccount,
+
+        /// <summary>LinkAccountAsync: the account already has an account of this provider linked.</summary>
+        AlreadyLinked,
+
+        /// <summary>UnlinkAccountAsync: the account has no account of this provider linked.</summary>
+        NotLinked,
+
+        /// <summary>LinkAccountAsync: the provider is turned off for this project.</summary>
+        ProviderDisabled,
+
+        /// <summary>
+        /// UnlinkAccountAsync: the provider account is the player's only way to sign in, so it stays.
+        /// </summary>
+        OnlySignInMethod,
+
+        /// <summary>The request expired before the player finished in the browser.</summary>
+        Expired,
+
+        /// <summary>The player chose Not now on the hosted page.</summary>
+        Denied,
+
+        /// <summary>The cancellation token fired; the game stopped waiting.</summary>
+        Cancelled,
+
+        /// <summary>
+        /// AUTH4D-343: the player signed in more than five minutes ago. Sign them in again, then retry.
+        /// </summary>
+        LoginRequired,
+    }
+
+    /// <summary>
+    /// LinkAccountAsync or UnlinkAccountAsync (AUTH4D-308) ended without changing the account. The
+    /// session is unchanged except after Cancelled, when the player may still have finished in the
+    /// browser.
+    /// </summary>
+    public sealed class Auth4LinkAccountException : Auth4Exception
+    {
+        public Auth4LinkAccountException(LinkAccountFailure reason, string error, int statusCode = 0, Exception inner = null)
+            : base(error, null, statusCode, inner)
+        {
+            Reason = reason;
+        }
+
+        public LinkAccountFailure Reason { get; }
+    }
+
+    /// <summary>
+    /// The refresh credential was rejected, or the player is banned (IsAccountSuspended); the local
+    /// session has been cleared.
+    /// </summary>
     public sealed class Auth4SessionExpiredException : Auth4Exception
     {
         public Auth4SessionExpiredException(string error, string description, int statusCode)
             : base(error, description, statusCode)
         {
         }
+    }
+    /// <summary>
+    /// SignInWithGameCenterAsync verified the player, but the application requires a verified email
+    /// address first (AUTH4D-311). Ask the player for an address, then call
+    /// SendGameCenterEmailCodeAsync and ConfirmGameCenterEmailCodeAsync with this continuation before
+    /// it expires. No session was created, and a guest session being linked is unchanged.
+    /// </summary>
+    public sealed class Auth4EmailVerificationRequiredException : Auth4Exception
+    {
+        public Auth4EmailVerificationRequiredException(
+            GameCenterEmailContinuation continuation,
+            string reason,
+            int statusCode)
+            : base("email_verification_required", null, statusCode)
+        {
+            Continuation = continuation;
+            Reason = reason;
+        }
+
+        public GameCenterEmailContinuation Continuation { get; }
+
+        /// <summary>no_email, unverified_email or always.</summary>
+        public string Reason { get; }
     }
 }

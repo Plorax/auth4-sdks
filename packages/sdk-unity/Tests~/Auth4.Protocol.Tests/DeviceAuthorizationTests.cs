@@ -127,6 +127,20 @@ namespace Auth4.Protocol.Tests
         }
 
         [Test]
+        public async Task SuspendedAccountIsTerminal()
+        {
+            var client = Client(DeviceServer(Pending, () => Error("account_suspended")), new FakeClock());
+            var authorization = await client.StartDeviceAuthorizationAsync();
+
+            var error = Assert.ThrowsAsync<Auth4DeviceAuthorizationException>(() => client.PollDeviceAuthorizationAsync(authorization));
+
+            Assert.That(error.Reason, Is.EqualTo(DeviceAuthorizationFailure.Suspended));
+            Assert.That(error.IsAccountSuspended, Is.True);
+            Assert.That(authorization.IsCompleted, Is.True);
+            Assert.That(client.CurrentSession, Is.Null);
+        }
+
+        [Test]
         public async Task PollingStopsAtLocalExpiryWithoutPollingPastIt()
         {
             var transport = DeviceServer(Pending);

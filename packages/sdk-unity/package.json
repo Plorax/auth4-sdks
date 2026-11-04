@@ -1,8 +1,8 @@
 {
   "name": "dev.auth4.sdk",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "displayName": "auth4.dev Authentication",
-  "description": "Game authentication for auth4.dev: device login, guest sessions with safe upgrades by email or social providers (in the system browser, or a popup in WebGL builds), adding, changing or removing a verified email address on a signed-in account, and rotating refresh tokens kept in memory unless a secure storage adapter is supplied.",
+  "description": "Game authentication for auth4.dev: device login, Apple Game Center sign-in, guest sessions with safe upgrades by email or social providers (in the system browser, or a popup in WebGL builds), adding, changing or removing a verified email address on a signed-in account, and rotating refresh tokens kept in memory unless a secure storage adapter is supplied.",
   "unity": "2022.3",
   "documentationUrl": "https://auth4.dev/docs/unity",
   "changelogUrl": "https://auth4.dev/docs/unity/changelog",
@@ -23,6 +23,11 @@
       "displayName": "Device Login",
       "description": "A scene with device login, guest play, saving guest progress and sign-out using in-memory tokens.",
       "path": "Samples~/DeviceLogin"
+    },
+    {
+      "displayName": "Game Center Sign-In",
+      "description": "Game Center sign-in on iOS and macOS, saving guest progress to Game Center and the verified email step, with an adapter for Apple's GameKit plug-in.",
+      "path": "Samples~/GameCenterSignIn"
     }
   ]
 }

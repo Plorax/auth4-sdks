@@ -139,7 +139,11 @@ namespace Auth4.Samples.DeviceLogin
             }
             catch (Auth4DeviceAuthorizationException error)
             {
-                _status = error.Reason == DeviceAuthorizationFailure.Denied ? "Sign-in was denied." : "The code expired.";
+                _status = error.Reason == DeviceAuthorizationFailure.Denied
+                    ? "Sign-in was denied."
+                    : error.Reason == DeviceAuthorizationFailure.Suspended
+                        ? "This account is suspended."
+                        : "The code expired.";
             }
             catch (Auth4Exception error)
             {

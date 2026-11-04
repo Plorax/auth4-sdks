@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -201,6 +202,12 @@ namespace Auth4.Protocol.Tests
 
         public int Writes { get; private set; }
 
+        /// <summary>When true, WriteAsync throws without storing anything (fault injection).</summary>
+        public bool FailWrites { get; set; }
+
+        /// <summary>When true, DeleteAsync throws too, to prove cleanup is best effort.</summary>
+        public bool FailDeletes { get; set; }
+
         public Task<string> ReadAsync(string key, CancellationToken cancellationToken)
         {
             return Task.FromResult(Values.TryGetValue(key, out var value) ? value : null);
@@ -209,12 +216,22 @@ namespace Auth4.Protocol.Tests
         public Task WriteAsync(string key, string value, CancellationToken cancellationToken)
         {
             Writes++;
+            if (FailWrites)
+            {
+                throw new IOException("keychain unavailable");
+            }
+
             Values[key] = value;
             return Task.CompletedTask;
         }
 
         public Task DeleteAsync(string key, CancellationToken cancellationToken)
         {
+            if (FailDeletes)
+            {
+                throw new IOException("keychain unavailable");
+            }
+
             Values.Remove(key);
             return Task.CompletedTask;
         }

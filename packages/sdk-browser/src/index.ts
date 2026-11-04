@@ -4,6 +4,8 @@ const MAX_CACHE_AGE_MS = 5 * 60 * 1_000;
 const DEFAULT_CACHE_AGE_MS = 60 * 1_000;
 const TOKEN_LIFETIME_LIMIT_SECONDS = 300;
 /** Renew this long before access-token expiry, plus up to RENEW_JITTER_MS of random lead. */
+/** Minimum gap between key-set refetches triggered by an unknown kid. */
+const JWKS_UNKNOWN_KID_COOLDOWN_MS = 30 * 1_000;
 const RENEW_LEAD_MS = 60 * 1_000;
 const RENEW_JITTER_MS = 30 * 1_000;
 const RENEW_RETRY_MS = 15 * 1_000;
@@ -60,11 +62,25 @@ const EMAIL_INTENT_REFUSALS = [
   "email_sign_in_disabled",
   "email_not_added",
   "only_sign_in_method",
+  "login_required",
 ] as const;
 /** AUTH4D-258 IdpClaimSchema: any well-formed method name, so a new method is still accepted. */
 const IDP = /^[a-z][a-z0-9_]{1,31}$/u;
 const ADD_EMAIL_INTENT = /^aei_[A-Za-z0-9_-]{32,64}$/u;
 const ADD_EMAIL_POLL_SECRET = /^aep_[A-Za-z0-9_-]{43,86}$/u;
+/** AUTH4D-308: the link-account window; like the email windows, it never receives a token. */
+const LINK_ACCOUNT_PATH = "/login/link-account";
+const LINK_ACCOUNT_WINDOW = "auth4-link-account";
+const LINK_ACCOUNT_INTENT = /^lai_[A-Za-z0-9_-]{32,64}$/u;
+const LINK_ACCOUNT_POLL_SECRET = /^lap_[A-Za-z0-9_-]{43,86}$/u;
+const LINK_INTENT_REFUSALS = [
+  "guest_account",
+  "provider_already_linked",
+  "provider_not_linked",
+  "provider_disabled",
+  "only_sign_in_method",
+  "login_required",
+] as const;
 const ADD_EMAIL_MIN_INTERVAL_SECONDS = 5;
 const ADD_EMAIL_MAX_INTERVAL_SECONDS = 60;
 const CALLBACK_PARAMETERS = [
@@ -137,7 +153,30 @@ export type Auth4BrowserErrorCode =
   | "only_sign_in_method"
   | "email_window_open"
   | "change_email_failed"
-  | "remove_email_failed";
+  | "remove_email_failed"
+  | "discord_activity_failed"
+  | "provider_already_linked"
+  | "provider_not_linked"
+  | "provider_disabled"
+  | "account_window_open"
+  | "link_account_failed"
+  | "unlink_account_failed"
+  | "linked_accounts_failed"
+  /**
+   * AUTH4D-310: the player has an active ban. Show that the account is suspended; the ban's reason
+   * is never sent to the application.
+   */
+  | "account_suspended"
+  /**
+   * AUTH4D-343: adding, changing or removing a sign-in method needs a sign-in from the last five
+   * minutes. Sign the player in again, then retry.
+   */
+  | "login_required"
+  /** AUTH4D-324: the name breaks a rule or contains a blocked word (one generic code for both). */
+  | "invalid_name"
+  /** AUTH4D-324: no discriminator is free for this name, or the change budget is spent. */
+  | "name_unavailable"
+  | "player_name_failed";
 
 export class Auth4BrowserError extends Error {
   readonly code: Auth4BrowserErrorCode;
@@ -226,6 +265,18 @@ export interface BrowserUser {
    * Later releases may add methods, so treat unknown values as valid.
    */
   idp?: string;
+  /** AUTH4D-324: the player's `Name#1234`, present with the `profile` scope once a name is set. */
+  name?: string;
+}
+
+/** AUTH4D-324: the player's display name. All three are null until a name is set. */
+export interface PlayerName {
+  /** The name as stored (trimmed and NFC normalised). */
+  name: string | null;
+  /** Four digits assigned by the server, such as "0427". */
+  discriminator: string | null;
+  /** `name#discriminator`, unique in the project. */
+  tag: string | null;
 }
 
 export interface BrowserSession {
@@ -237,6 +288,22 @@ export interface BrowserSession {
 
 export interface GuestSignInOptions {
   signal?: AbortSignal;
+}
+
+/** AUTH4D-312: options for signInWithDiscordActivity(). */
+export interface DiscordActivitySignInOptions {
+  /** The code from the Discord Embedded App SDK's authorize() command. */
+  code: string;
+  signal?: AbortSignal;
+}
+
+export interface DiscordActivitySignInResult {
+  session: BrowserSession;
+  /**
+   * The Discord access token for the Embedded App SDK's authenticate() command. The client keeps
+   * no copy; pass it on and drop it.
+   */
+  discord: { accessToken: string; expiresIn: number; scope: string };
 }
 
 export interface GuestUpgradeOptions {
@@ -287,6 +354,38 @@ export interface RemoveEmailResult {
   session: BrowserSession;
 }
 
+/** Provider accounts a signed-in player can link and unlink (AUTH4D-308). */
+export type LinkableProvider = "steam" | "discord" | "epic";
+
+const LINKABLE_PROVIDERS: readonly LinkableProvider[] = ["steam", "discord", "epic"];
+
+/** Options for linkAccount() and unlinkAccount(). */
+export interface LinkAccountOptions {
+  /** Aborting closes the window and rejects with `cancelled`. */
+  signal?: AbortSignal;
+}
+
+export type UnlinkAccountOptions = LinkAccountOptions;
+
+export interface LinkAccountResult {
+  /** The refreshed session for the same user; the user ID never changes. */
+  session: BrowserSession;
+  identity: { identityId: string; provider: LinkableProvider };
+}
+
+export interface UnlinkAccountResult {
+  /** The refreshed session for the same user. */
+  session: BrowserSession;
+}
+
+/** One sign-in method of the account, without its provider subject or address. */
+export interface LinkedAccount {
+  identityId: string;
+  /** "email", "phone", "steam", "discord", "epic", "google", "apple", "microsoft" or "sso". */
+  provider: string;
+  linkedAt: string;
+}
+
 /** Session lifecycle events. They never carry token values. */
 export type BrowserSessionEvent =
   | { type: "renewed"; session: BrowserSession }
@@ -294,6 +393,8 @@ export type BrowserSessionEvent =
   | { type: "email_added"; session: BrowserSession }
   | { type: "email_changed"; session: BrowserSession }
   | { type: "email_removed"; session: BrowserSession }
+  | { type: "account_linked"; session: BrowserSession }
+  | { type: "account_unlinked"; session: BrowserSession }
   | { type: "signed_out"; reason: "logout" | "refresh_rejected" };
 
 export type BrowserSessionListener = (event: BrowserSessionEvent) => void;
@@ -358,6 +459,20 @@ interface PendingEmailWindow {
   action: EmailAction;
   popup: Window;
   promise: Promise<EmailActionResults[EmailAction]>;
+}
+
+type AccountAction = "link" | "unlink";
+
+interface AccountActionResults {
+  link: LinkAccountResult;
+  unlink: UnlinkAccountResult;
+}
+
+interface PendingAccountWindow {
+  action: AccountAction;
+  provider: LinkableProvider;
+  popup: Window;
+  promise: Promise<AccountActionResults[AccountAction]>;
 }
 
 interface ParsedTokenSet {
@@ -565,6 +680,19 @@ function renewalTime(issuedAt: number, expiresAt: number): number {
   return Math.floor(expiresAt - lead - jitter);
 }
 
+/** AUTH4D-310: the one error a banned player gets; nothing else about the ban is sent. */
+function accountSuspended(): Auth4BrowserError {
+  return new Auth4BrowserError("account_suspended", "This account is suspended.");
+}
+
+async function suspendedResponse(response: Response): Promise<boolean> {
+  try {
+    return asRecord(await response.json())?.["error"] === "account_suspended";
+  } catch {
+    return false;
+  }
+}
+
 async function readTokenSet(
   response: Response,
   code: Auth4BrowserErrorCode,
@@ -720,9 +848,13 @@ export class Auth4BrowserClient {
   #refreshing: Promise<void> | undefined;
   #renewTimer: ReturnType<typeof setTimeout> | undefined;
   #generation = 0;
+  #jwksRefresh: Promise<JsonWebKeySet> | undefined;
+  #lastUnknownKidRefreshAt = Number.NEGATIVE_INFINITY;
   #upgrade: PendingUpgrade | undefined;
   /** The one pending add, change or remove email window. */
   #emailWindow: PendingEmailWindow | undefined;
+  /** AUTH4D-308: the one pending link or unlink window. */
+  #accountWindow: PendingAccountWindow | undefined;
   readonly #listeners = new Set<BrowserSessionListener>();
 
   constructor(readonly options: BrowserClientOptions) {
@@ -1047,6 +1179,7 @@ export class Auth4BrowserClient {
           throw new Auth4BrowserError("invalid_callback", "Authorization callback is ambiguous.");
         const silentError = SILENT_ERRORS.find((value) => value === errors[0]);
         if (silent && stored.prompt === "none" && silentError) return { error: silentError };
+        if (errors[0] === "account_suspended") throw accountSuspended();
         throw new Auth4BrowserError("authorization_failed", `Hosted login returned ${errors[0]}.`);
       }
       if (codes.length !== 1 || !codes[0] || codes[0].length > 4_096) {
@@ -1074,6 +1207,7 @@ export class Auth4BrowserClient {
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
       if (!tokenResponse.ok) {
+        if (await suspendedResponse(tokenResponse)) throw accountSuspended();
         throw new Auth4BrowserError(
           "token_exchange_failed",
           `Token exchange returned HTTP ${tokenResponse.status}.`,
@@ -1165,20 +1299,29 @@ export class Auth4BrowserClient {
       throw new Auth4BrowserError("token_expired", "No active browser session is available.");
     }
     const expectedSubject = this.activeTokens.user.sub;
+    const generation = this.#generation;
+    // A response for a session that ended or changed player must never be committed or returned.
+    const stale = () =>
+      generation !== this.#generation || this.activeTokens?.user.sub !== expectedSubject;
+    const superseded = () =>
+      new Auth4BrowserError("invalid_session", "The session changed while loading the user.");
     try {
       const discovery = await this.discover(options.signal);
+      if (stale()) throw superseded();
       const response = await this.fetcher(discovery.userinfo_endpoint, {
         method: "GET",
         headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` },
         cache: "no-store",
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
+      if (stale()) throw superseded();
       if (!response.ok)
         throw new Auth4BrowserError(
           "userinfo_failed",
           `UserInfo returned HTTP ${response.status}.`,
         );
       const record = asRecord(await response.json());
+      if (stale()) throw superseded();
       if (record?.["sub"] !== expectedSubject) {
         throw new Auth4BrowserError(
           "userinfo_failed",
@@ -1190,6 +1333,10 @@ export class Auth4BrowserClient {
       if (typeof record["email_verified"] === "boolean")
         user.email_verified = record["email_verified"];
       if (typeof record["idp"] === "string" && IDP.test(record["idp"])) user.idp = record["idp"];
+      if (typeof record["name"] === "string" && record["name"].length <= 80) {
+        user.name = record["name"];
+      }
+      if (!this.activeTokens) throw superseded();
       this.activeTokens.user = user;
       return user;
     } catch (cause) {
@@ -1338,6 +1485,105 @@ export class Auth4BrowserClient {
     checkAbort(options.signal);
     const { userId, tokens } = readGuestTokenSet(raw, "guest_sign_in_failed");
     return this.startSession(tokens, { sub: userId }, "");
+  }
+
+  /**
+   * Sign a player in from a game running as a Discord Activity (AUTH4D-312). Pass the code from
+   * the Embedded App SDK's authorize() command; it is exchanged at
+   * POST {issuer}/identity/discord/activity, which the application must have turned on for this
+   * Activity's origin. The ID token is checked as for a redirect sign-in, the auth4 tokens are held
+   * in memory only, and any current session is replaced. Inside Discord, route the auth origin
+   * through a URL mapping (for example with patchUrlMappings) before creating the client, or pass
+   * a `fetch` that does.
+   *
+   * Rejects with `discord_activity_failed` (the message names the server's error code, such as
+   * `interaction_required` or `invalid_grant`), `invalid_id_token`, `discovery_failed` or
+   * `cancelled`.
+   */
+  async signInWithDiscordActivity(
+    options: DiscordActivitySignInOptions,
+  ): Promise<DiscordActivitySignInResult> {
+    checkAbort(options.signal);
+    if (typeof options.code !== "string" || !/^[A-Za-z0-9._~-]{8,512}$/u.test(options.code)) {
+      throw new Auth4BrowserError(
+        "configuration_error",
+        "Pass the code from the Discord authorize() command.",
+      );
+    }
+    const discovery = await this.discover(options.signal);
+    const nonce = randomValue();
+    let response: Response;
+    let raw: unknown;
+    try {
+      response = await this.fetcher(`${this.options.issuer}/identity/discord/activity`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: this.options.clientId, code: options.code, nonce }),
+        // The SDK keeps tokens in memory; it never asks the browser to store session cookies.
+        credentials: "omit",
+        cache: "no-store",
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
+      raw = await response.json();
+    } catch (cause) {
+      const cancelled = fromAbort(cause, options.signal);
+      if (cancelled) throw cancelled;
+      throw new Auth4BrowserError(
+        "discord_activity_failed",
+        "Unable to complete the Discord Activity sign-in.",
+        cause,
+      );
+    }
+    const record = asRecord(raw);
+    if (!response.ok) {
+      const error = record?.["error"];
+      throw new Auth4BrowserError(
+        "discord_activity_failed",
+        `Discord Activity sign-in returned HTTP ${response.status}${typeof error === "string" && /^[a-z_]{1,64}$/u.test(error) ? ` (${error})` : ""}.`,
+      );
+    }
+    checkAbort(options.signal);
+    const tokens = parseTokenSet(raw, "discord_activity_failed", true);
+    const discord = asRecord(record?.["discord"]);
+    const discordToken = discord?.["access_token"];
+    const discordExpiresIn = discord?.["expires_in"];
+    const discordScope = discord?.["scope"];
+    if (
+      typeof discordToken !== "string" ||
+      discordToken.length === 0 ||
+      discordToken.length > 8_192 ||
+      typeof discord?.["token_type"] !== "string" ||
+      discord["token_type"].toLowerCase() !== "bearer" ||
+      typeof discordExpiresIn !== "number" ||
+      !Number.isInteger(discordExpiresIn) ||
+      discordExpiresIn <= 0 ||
+      typeof discordScope !== "string"
+    ) {
+      throw new Auth4BrowserError(
+        "discord_activity_failed",
+        "The response did not include a Discord access token.",
+      );
+    }
+    const claims = await this.validateIdToken(tokens.idToken!, nonce, discovery, options.signal);
+    if (
+      record?.["user_id"] !== claims.sub ||
+      accessTokenClaims(tokens.accessToken)?.["sub"] !== claims.sub
+    ) {
+      throw new Auth4BrowserError(
+        "discord_activity_failed",
+        "The tokens are not for the same user.",
+      );
+    }
+    checkAbort(options.signal);
+    const session = this.startSession(
+      tokens,
+      { sub: claims.sub, ...(claims.idp === undefined ? {} : { idp: claims.idp }) },
+      nonce,
+    );
+    return {
+      session,
+      discord: { accessToken: discordToken, expiresIn: discordExpiresIn, scope: discordScope },
+    };
   }
 
   /**
@@ -1860,6 +2106,398 @@ export class Auth4BrowserClient {
   }
 
   /**
+   * Let a signed-in player link a Steam, Discord or Epic Games account to their account
+   * (AUTH4D-308), so either sign-in reaches the same user. Call it synchronously from a user
+   * gesture: the hosted /login/link-account window opens before the first await, sends the player
+   * to the provider and asks them to confirm. The SDK polls with a poll secret it keeps in memory;
+   * the window never receives a token. On success the in-memory token set is replaced with the
+   * refreshed session for the same user and an `account_linked` session event is emitted.
+   *
+   * Rejects with `invalid_session`, `guest_account` (use upgradeGuest), `provider_already_linked`,
+   * `provider_disabled`, `popup_blocked`, `account_window_open` (another link or unlink window is
+   * pending), `cancelled`, `window_closed` or `link_account_failed`. A provider account that
+   * already belongs to another user is refused in the window, which lets the player try another.
+   */
+  linkAccount(
+    provider: LinkableProvider,
+    options: LinkAccountOptions = {},
+  ): Promise<LinkAccountResult> {
+    return this.openAccountWindow("link", provider, options);
+  }
+
+  /**
+   * Let a signed-in player unlink a Steam, Discord or Epic Games account (AUTH4D-308). It works like
+   * linkAccount(): call it from a user gesture, and the hosted window asks the player to confirm.
+   * On success that provider account no longer signs in to this user, the in-memory token set is
+   * replaced with a refreshed session for the same user and an `account_unlinked` event is emitted.
+   *
+   * Rejects with `invalid_session`, `guest_account`, `provider_not_linked`, `only_sign_in_method`
+   * (it is the account's only way to sign in), `popup_blocked`, `account_window_open`,
+   * `cancelled`, `window_closed` or `unlink_account_failed`.
+   */
+  unlinkAccount(
+    provider: LinkableProvider,
+    options: UnlinkAccountOptions = {},
+  ): Promise<UnlinkAccountResult> {
+    return this.openAccountWindow("unlink", provider, options);
+  }
+
+  /**
+   * The signed-in account's sign-in methods (AUTH4D-308), without provider subjects or addresses.
+   * A guest identity is never listed. Rejects with `invalid_session` or `linked_accounts_failed`.
+   */
+  async linkedAccounts(options: { signal?: AbortSignal } = {}): Promise<LinkedAccount[]> {
+    const accessToken = await this.getAccessTokenSilently();
+    if (!accessToken) {
+      throw new Auth4BrowserError("invalid_session", "No active session is available.");
+    }
+    const listed = await this.addEmailRequest(
+      "/account/identities",
+      { client_id: this.options.clientId },
+      options.signal,
+      accessToken,
+    ).catch((cause: unknown) => {
+      throw (
+        fromAbort(cause, options.signal) ??
+        new Auth4BrowserError("linked_accounts_failed", "Unable to list linked accounts.", cause)
+      );
+    });
+    if (!listed.ok) {
+      if (listed.error === "invalid_session" || listed.status === 401) {
+        throw new Auth4BrowserError("invalid_session", "The session has ended.");
+      }
+      throw new Auth4BrowserError(
+        "linked_accounts_failed",
+        `Listing linked accounts returned HTTP ${listed.status}.`,
+      );
+    }
+    const accounts = listed.body["accounts"];
+    if (!Array.isArray(accounts)) {
+      throw new Auth4BrowserError("linked_accounts_failed", "The linked accounts are malformed.");
+    }
+    return accounts.flatMap((value) => {
+      const account = asRecord(value);
+      const identityId = account?.["identity_id"];
+      const provider = account?.["provider"];
+      const linkedAt = account?.["linked_at"];
+      return typeof identityId === "string" &&
+        typeof provider === "string" &&
+        typeof linkedAt === "string"
+        ? [{ identityId, provider, linkedAt }]
+        : [];
+    });
+  }
+
+  /**
+   * The signed-in player's display name (AUTH4D-324). Rejects with `invalid_session` or
+   * `player_name_failed`.
+   */
+  async getPlayerName(options: { signal?: AbortSignal } = {}): Promise<PlayerName> {
+    return this.playerNameRequest("GET", undefined, options.signal);
+  }
+
+  /**
+   * Set (or with null, clear) the player's display name. The server trims and normalises it and
+   * assigns the #NNNN discriminator; keeping the same name (ignoring case) keeps the discriminator.
+   * Names are 1-32 characters with no spaces, control characters or '#'. Rejects with
+   * `invalid_name` (a rule or a blocked word), `name_unavailable`, `invalid_session` or
+   * `player_name_failed`.
+   */
+  async setPlayerName(
+    name: string | null,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<PlayerName> {
+    if (name !== null && typeof name !== "string") {
+      throw new Auth4BrowserError("invalid_name", "The name must be a string or null.");
+    }
+    return this.playerNameRequest("PUT", { name }, options.signal);
+  }
+
+  private async playerNameRequest(
+    method: "GET" | "PUT",
+    body: { name: string | null } | undefined,
+    signal?: AbortSignal,
+  ): Promise<PlayerName> {
+    const accessToken = await this.getAccessTokenSilently();
+    if (!accessToken) {
+      throw new Auth4BrowserError("invalid_session", "No active session is available.");
+    }
+    let response: Response;
+    let record: Record<string, unknown>;
+    try {
+      response = await this.fetcher(`${this.options.issuer}/me/name`, {
+        method,
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${accessToken}`,
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        credentials: "omit",
+        cache: "no-store",
+        ...(signal === undefined ? {} : { signal }),
+      });
+      record = asRecord(await response.json().catch(() => null)) ?? {};
+    } catch (cause) {
+      throw (
+        fromAbort(cause, signal) ??
+        new Auth4BrowserError("player_name_failed", "Unable to reach the name endpoint.", cause)
+      );
+    }
+    if (!response.ok) {
+      const error = record["error"];
+      if (response.status === 401) {
+        throw new Auth4BrowserError("invalid_session", "The session has ended.");
+      }
+      if (error === "invalid_name") {
+        throw new Auth4BrowserError("invalid_name", "This name can't be used.");
+      }
+      if (error === "name_unavailable" || response.status === 429) {
+        throw new Auth4BrowserError("name_unavailable", "This name is not available right now.");
+      }
+      throw new Auth4BrowserError(
+        "player_name_failed",
+        `The name endpoint returned HTTP ${response.status}.`,
+      );
+    }
+    const name = record["name"];
+    const discriminator = record["discriminator"];
+    const tag = record["tag"];
+    const unset = name === null && discriminator === null && tag === null;
+    const set =
+      typeof name === "string" &&
+      typeof discriminator === "string" &&
+      /^[0-9]{4}$/u.test(discriminator) &&
+      tag === `${name}#${discriminator}`;
+    if (!unset && !set) {
+      throw new Auth4BrowserError("player_name_failed", "The name response is malformed.");
+    }
+    return { name, discriminator, tag } as PlayerName;
+  }
+
+  /** Open the link-account window inside the caller's gesture; one window at a time. */
+  private openAccountWindow<A extends AccountAction>(
+    action: A,
+    provider: LinkableProvider,
+    options: LinkAccountOptions,
+  ): Promise<AccountActionResults[A]> {
+    const failed = action === "link" ? "link_account_failed" : "unlink_account_failed";
+    const pending = this.#accountWindow;
+    if (pending) {
+      try {
+        pending.popup.focus();
+      } catch {
+        // Focus is best effort.
+      }
+      if (pending.action === action && pending.provider === provider) {
+        return pending.promise as Promise<AccountActionResults[A]>;
+      }
+      return Promise.reject(
+        new Auth4BrowserError(
+          "account_window_open",
+          "Another linked accounts window is open; finish or close it first.",
+        ),
+      );
+    }
+    let browser: Window;
+    try {
+      checkAbort(options.signal);
+      if (!LINKABLE_PROVIDERS.includes(provider)) {
+        throw new Auth4BrowserError("configuration_error", "Unknown provider to link.");
+      }
+      browser = this.browserWindow();
+      const session = this.getSession();
+      if (!session || !this.activeTokens) {
+        throw new Auth4BrowserError("invalid_session", "No active session is available.");
+      }
+      if (session.isGuest) {
+        throw new Auth4BrowserError(
+          "guest_account",
+          "Guests save their progress with upgradeGuest(), which can link a provider account.",
+        );
+      }
+    } catch (cause) {
+      return Promise.reject(
+        cause instanceof Auth4BrowserError
+          ? cause
+          : new Auth4BrowserError(
+              "configuration_error",
+              "Linking accounts needs a browser.",
+              cause,
+            ),
+      );
+    }
+    let opened: Window | null;
+    try {
+      // Opened blank inside the caller's gesture; the page URL is known only once the intent exists.
+      opened = browser.open("about:blank", LINK_ACCOUNT_WINDOW, UPGRADE_WINDOW_FEATURES);
+    } catch {
+      opened = null;
+    }
+    if (!opened) {
+      return Promise.reject(
+        new Auth4BrowserError("popup_blocked", "The browser blocked the link-account window."),
+      );
+    }
+    const popup = opened;
+    const promise = this.runAccountAction(action, provider, popup, failed, options.signal).finally(
+      () => {
+        if (this.#accountWindow?.promise === promise) this.#accountWindow = undefined;
+      },
+    );
+    this.#accountWindow = { action, provider, popup, promise };
+    return promise;
+  }
+
+  private async runAccountAction<A extends AccountAction>(
+    action: A,
+    provider: LinkableProvider,
+    popup: Window,
+    failed: "link_account_failed" | "unlink_account_failed",
+    signal?: AbortSignal,
+  ): Promise<AccountActionResults[A]> {
+    const generation = this.#generation;
+    const subject = this.activeTokens!.user.sub;
+    const authOrigin = new URL(this.options.issuer).origin;
+    const sessionEnded = () =>
+      new Auth4BrowserError("invalid_session", `The session ended while trying to ${action}.`);
+    try {
+      const accessToken = await this.getAccessTokenSilently();
+      if (!accessToken || generation !== this.#generation) throw sessionEnded();
+      const created = await this.addEmailRequest(
+        "/account/link/intent",
+        { client_id: this.options.clientId, provider, action },
+        signal,
+        accessToken,
+      );
+      if (!created.ok) {
+        if (created.error === "invalid_session" || created.status === 401) throw sessionEnded();
+        const refusal = LINK_INTENT_REFUSALS.find((code) => code === created.error);
+        if (refusal) throw new Auth4BrowserError(refusal, `The ${action} request was refused.`);
+        throw new Auth4BrowserError(
+          failed,
+          `The ${action} request returned HTTP ${created.status}.`,
+        );
+      }
+      const { intent, poll_secret: pollSecret, expires_in: expiresIn } = created.body;
+      const interval = created.body["interval"];
+      let page: URL | null = null;
+      try {
+        page = new URL(String(created.body["link_uri"]));
+      } catch {
+        page = null;
+      }
+      // Only the hosted link-account page, on the auth origin, may be loaded in the window.
+      if (
+        typeof intent !== "string" ||
+        !LINK_ACCOUNT_INTENT.test(intent) ||
+        typeof pollSecret !== "string" ||
+        !LINK_ACCOUNT_POLL_SECRET.test(pollSecret) ||
+        page?.origin !== authOrigin ||
+        page.pathname !== LINK_ACCOUNT_PATH ||
+        typeof expiresIn !== "number" ||
+        expiresIn <= 0 ||
+        typeof interval !== "number"
+      ) {
+        throw new Auth4BrowserError(failed, `The ${action} response is malformed.`);
+      }
+      popup.location.replace(page.toString());
+
+      const deadline = this.currentTime() + expiresIn * 1_000;
+      let wait = Math.min(
+        ADD_EMAIL_MAX_INTERVAL_SECONDS,
+        Math.max(ADD_EMAIL_MIN_INTERVAL_SECONDS, Math.ceil(interval)),
+      );
+      for (;;) {
+        await delay(wait * 1_000, signal);
+        if (generation !== this.#generation) throw sessionEnded();
+        let windowClosed = true;
+        try {
+          windowClosed = popup.closed;
+        } catch {
+          // Treat an inaccessible window as closed.
+        }
+        // Not cancellable once sent: the refreshed session is released exactly once.
+        const polled = await this.addEmailRequest("/account/link/intent/token", {
+          client_id: this.options.clientId,
+          intent,
+          poll_secret: pollSecret,
+        });
+        if (polled.ok) {
+          return this.completeAccountAction(action, provider, polled.body, generation, subject);
+        }
+        if (polled.error === "access_denied") {
+          throw new Auth4BrowserError(
+            "cancelled",
+            `The player chose not to ${action} ${provider}.`,
+          );
+        }
+        if (polled.error === "slow_down") {
+          const serverInterval = polled.body["interval"];
+          wait = Math.min(
+            ADD_EMAIL_MAX_INTERVAL_SECONDS,
+            Math.max(wait + 5, typeof serverInterval === "number" ? serverInterval : 0),
+          );
+        } else if (polled.error !== "authorization_pending") {
+          throw new Auth4BrowserError(
+            failed,
+            polled.error === "expired_token"
+              ? `The ${action} request expired.`
+              : `The ${action} request failed with HTTP ${polled.status}.`,
+          );
+        } else if (windowClosed) {
+          throw new Auth4BrowserError("window_closed", "The link-account window was closed.");
+        }
+        if (this.currentTime() >= deadline) {
+          throw new Auth4BrowserError(failed, `The ${action} request expired.`);
+        }
+      }
+    } catch (cause) {
+      try {
+        popup.close();
+      } catch {
+        // Already closed.
+      }
+      const cancelled = fromAbort(cause, signal);
+      if (cancelled) throw cancelled;
+      if (cause instanceof Auth4BrowserError) throw cause;
+      throw new Auth4BrowserError(failed, `Unable to ${action} ${provider}.`, cause);
+    }
+  }
+
+  /** Validate the refreshed session and swap the in-memory token set in one synchronous step. */
+  private completeAccountAction<A extends AccountAction>(
+    action: A,
+    provider: LinkableProvider,
+    raw: Record<string, unknown>,
+    generation: number,
+    subject: string,
+  ): AccountActionResults[A] {
+    const failed = action === "link" ? "link_account_failed" : "unlink_account_failed";
+    if (generation !== this.#generation || this.activeTokens?.user.sub !== subject) {
+      throw new Auth4BrowserError(
+        "invalid_session",
+        `The local session changed while trying to ${action}; sign in again.`,
+      );
+    }
+    const { tokens, record } = readGuestTokenSet(raw, failed, subject);
+    const { user, nonce } = this.activeTokens;
+    if (action === "unlink") {
+      const session = this.startSession(tokens, { ...user }, nonce);
+      this.emit({ type: "account_unlinked", session });
+      return { session } as AccountActionResults[A];
+    }
+    const identity = asRecord(record["identity"]);
+    const identityId = identity?.["identity_id"];
+    if (typeof identityId !== "string" || identity?.["provider"] !== provider) {
+      throw new Auth4BrowserError(failed, "The link result is invalid.");
+    }
+    const session = this.startSession(tokens, { ...user }, nonce);
+    this.emit({ type: "account_linked", session });
+    return { session, identity: { identityId, provider } } as AccountActionResults[A];
+  }
+
+  /**
    * Replace every in-memory credential at once. Bumping the generation (in clearSession) makes any
    * renewal still in flight for the previous token set discard its result.
    */
@@ -1943,6 +2581,7 @@ export class Auth4BrowserClient {
     // opt-out) or a response that cannot be trusted.
     try {
       if (!response.ok) {
+        if (await suspendedResponse(response)) throw accountSuspended();
         throw new Auth4BrowserError(
           "refresh_failed",
           `Token refresh was rejected with HTTP ${response.status}; sign in again.`,
@@ -1979,7 +2618,11 @@ export class Auth4BrowserClient {
       if (generation !== this.#generation) throw superseded();
       this.clearSession();
       this.emit({ type: "signed_out", reason: "refresh_rejected" });
-      if (cause instanceof Auth4BrowserError && cause.code === "refresh_failed") throw cause;
+      if (
+        cause instanceof Auth4BrowserError &&
+        (cause.code === "refresh_failed" || cause.code === "account_suspended")
+      )
+        throw cause;
       throw new Auth4BrowserError("refresh_failed", "Token refresh failed; sign in again.", cause);
     }
   }
@@ -2056,14 +2699,21 @@ export class Auth4BrowserClient {
       if (header["crit"] !== undefined || header["b64"] !== undefined)
         throw new Error("Unsupported critical JWT header.");
 
-      const jwks = await this.getJwks(discovery, signal);
-      const matchingKeys = jwks.keys.filter(
-        (key) =>
-          key.kid === header["kid"] &&
-          key.kty === "RSA" &&
-          (key.use === undefined || key.use === "sig") &&
-          (key.alg === undefined || key.alg === "RS256"),
-      );
+      const findKeys = (set: JsonWebKeySet) =>
+        set.keys.filter(
+          (key) =>
+            key.kid === header["kid"] &&
+            key.kty === "RSA" &&
+            (key.use === undefined || key.use === "sig") &&
+            (key.alg === undefined || key.alg === "RS256"),
+        );
+      const cachedBefore =
+        this.jwksCache !== undefined && this.jwksCache.expiresAt > this.currentTime();
+      let matchingKeys = findKeys(await this.getJwks(discovery, signal));
+      // A key published after the cache was filled: refetch once (shared, cooldown-bound).
+      if (matchingKeys.length === 0 && cachedBefore) {
+        matchingKeys = findKeys(await this.refreshJwksForUnknownKid(discovery, signal));
+      }
       if (matchingKeys.length !== 1)
         throw new Error("ID-token signing key is missing or ambiguous.");
       const publicKey = await globalThis.crypto.subtle.importKey(
@@ -2139,12 +2789,52 @@ export class Auth4BrowserClient {
     }
   }
 
+  /**
+   * Refetch the key set once for an unknown kid. Concurrent misses share one
+   * fetch, and at most one such fetch runs per cooldown window; inside the
+   * window the cached set is returned unchanged. The shared fetch is not tied
+   * to one caller's signal, so each caller only stops waiting when aborted.
+   */
+  private async refreshJwksForUnknownKid(
+    discovery: DiscoveryDocument,
+    signal?: AbortSignal,
+  ): Promise<JsonWebKeySet> {
+    checkAbort(signal);
+    if (!this.#jwksRefresh) {
+      const now = this.currentTime();
+      const cached = this.jwksCache?.jwks;
+      if (cached && now - this.#lastUnknownKidRefreshAt < JWKS_UNKNOWN_KID_COOLDOWN_MS) {
+        return cached;
+      }
+      this.#lastUnknownKidRefreshAt = now;
+      const pending = this.fetchJwks(discovery).finally(() => {
+        if (this.#jwksRefresh === pending) this.#jwksRefresh = undefined;
+      });
+      pending.catch(() => undefined);
+      this.#jwksRefresh = pending;
+    }
+    const shared = this.#jwksRefresh;
+    if (!signal) return shared;
+    return new Promise<JsonWebKeySet>((resolve, reject) => {
+      const onAbort = () => reject(fromAbort(signal.reason, signal) ?? signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      shared.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+    });
+  }
+
   private async getJwks(
     discovery: DiscoveryDocument,
     signal?: AbortSignal,
   ): Promise<JsonWebKeySet> {
     checkAbort(signal);
     if (this.jwksCache && this.jwksCache.expiresAt > this.currentTime()) return this.jwksCache.jwks;
+    return this.fetchJwks(discovery, signal);
+  }
+
+  private async fetchJwks(
+    discovery: DiscoveryDocument,
+    signal?: AbortSignal,
+  ): Promise<JsonWebKeySet> {
     let response: Response;
     try {
       response = await this.fetcher(discovery.jwks_uri, {

@@ -76,6 +76,40 @@ namespace Auth4.Internal
             return builder.Append('}').ToString();
         }
 
+        /// <summary>Like SerializeStrings, with unsigned integers written as JSON numbers.</summary>
+        public static string SerializeFields(IEnumerable<KeyValuePair<string, object>> values)
+        {
+            var builder = new StringBuilder("{");
+            var first = true;
+            foreach (var pair in values)
+            {
+                if (!first)
+                {
+                    builder.Append(',');
+                }
+
+                first = false;
+                WriteString(builder, pair.Key);
+                builder.Append(':');
+                switch (pair.Value)
+                {
+                    case null:
+                        builder.Append("null");
+                        break;
+                    case ulong number:
+                        builder.Append(number.ToString(CultureInfo.InvariantCulture));
+                        break;
+                    case string text:
+                        WriteString(builder, text);
+                        break;
+                    default:
+                        throw new ArgumentException("Only strings and unsigned integers are serialized.");
+                }
+            }
+
+            return builder.Append('}').ToString();
+        }
+
         private static void WriteString(StringBuilder builder, string value)
         {
             builder.Append('"');

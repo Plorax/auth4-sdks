@@ -245,7 +245,7 @@ try
 }
 catch (Auth4AddEmailException error)
 {
-    // GuestAccount, NotAdded, EmailSignInDisabled, Expired, Denied or Cancelled.
+    // GuestAccount, NotAdded, EmailSignInDisabled, LoginRequired, Expired, Denied or Cancelled.
     Debug.Log("The email address was not changed: " + error.Reason);
 }
 
@@ -259,10 +259,70 @@ catch (Auth4AddEmailException error) when (error.Reason == AddEmailFailure.OnlyS
 }
 ```
 
+Adding, changing or removing an address, and linking or unlinking an account, need a sign-in from
+the last five minutes. An older session gets `LoginRequired`: sign the player in again, then retry.
+After a change or removal the old address gets a notice and the player's other sessions end.
+
 A change sends a code to the new address, and `ChangeEmailResult` holds the new address and email
 identity. A removal needs only the player's confirmation and returns `RemoveEmailResult` with the
 session. Each method opens only its own hosted page on the auth origin. Only one guest upgrade or
 email request runs at a time; a second call throws `InvalidOperationException`.
+
+## Apple Game Center (iOS and macOS)
+
+`SignInWithGameCenterAsync` signs the player in with Game Center (AUTH4D-311). The client does not
+call GameKit itself: pass an `IAuth4GameCenter` adapter as `Auth4ClientOptions.GameCenter`. The
+**Game Center Sign-In** sample has one built on Apple's GameKit plug-in for Unity; add the plug-in
+and the `AUTH4_APPLE_GAMEKIT` scripting define symbol on iOS and macOS. In the console, allow the
+app's bundle id for the game application.
+
+```csharp
+try
+{
+    var session = await client.SignInWithGameCenterAsync(cts.Token);
+}
+catch (Auth4EmailVerificationRequiredException required)
+{
+    // The application requires a verified email address. Ask the player for one.
+    await client.SendGameCenterEmailCodeAsync(required.Continuation, email, cts.Token);
+    var session = await client.ConfirmGameCenterEmailCodeAsync(required.Continuation, code, cts.Token);
+}
+```
+
+- The adapter returns what `GKLocalPlayer.fetchItems(forIdentityVerificationSignature:)` returned,
+  with the `teamPlayerID` (the `gamePlayerID` for Apple Arcade games) and the bundle id. The server
+  checks the signature against Apple's key and accepts each signature once, for five minutes, so the
+  adapter fetches a new one for every sign-in.
+- When a guest is signed in, the same call links the Game Center player to the guest. The user ID
+  stays the same and the guest session is replaced. A Game Center player who already has an account
+  gets `409 identity_in_use`, and the guest session is unchanged.
+- `invalid_code` lets the player try the code again. `email_unavailable` means another account
+  keeps the address, so ask for a different one. `step_expired` means the step ended; sign in with
+  Game Center again.
+- Without a supported adapter (for example on Windows or Android) the call throws
+  `PlatformNotSupportedException`.
+
+## Player names
+
+`GetPlayerNameAsync` and `UpdatePlayerNameAsync` read and set the signed-in player's public display
+name (AUTH4D-324), like Unity Authentication's methods of the same names. The server adds a random
+four-digit number, so the full name (`Tag`, such as `Ace#0427`) is unique in the project.
+
+```csharp
+var current = await client.GetPlayerNameAsync(cts.Token);
+if (!current.IsSet)
+{
+    var named = await client.UpdatePlayerNameAsync("Ace", cts.Token);
+    Debug.Log(named.Tag); // Ace#0427
+}
+```
+
+- Names are 1 to 32 characters with no spaces, control characters or `#`. The server trims and
+  normalises them. Keeping the same name with a different case keeps the number.
+- `UpdatePlayerNameAsync(null)` clears the name.
+- `Auth4Exception.Error` is `invalid_name` when the name breaks a rule or contains one of the
+  project's blocked words (the two are deliberately the same error), `name_unavailable` when no
+  number is free, and `rate_limited` after more than 10 attempts in an hour.
 
 ## Tokens
 
@@ -284,8 +344,24 @@ restart. To persist sessions, implement `ISecureStorageAdapter` on top of the pl
 store, such as the iOS Keychain, Android Keystore-backed encryption, Windows DPAPI or a console
 vendor's protected save API, and pass it explicitly. Then call `TryRestoreSessionAsync()` at start-up.
 
+`TryRestoreSessionAsync()` returns `true` only after the refresh returned a usable access token.
+It returns `false` when nothing usable is stored or the server rejected the credential
+(`invalid_grant`), which clears the stored record. A transient failure (network, 5xx) throws,
+keeps the stored credential and leaves `CurrentSession` null, so call it again to retry.
+Concurrent calls share one refresh, cancelling one caller does not cancel the others, and a
+`SignOutAsync()` during a pending restore is never undone by the late response.
+
 Adapters must encrypt with an OS-protected key and must never write to `PlayerPrefs`, plain files or
 logs. Only the refresh token, user ID and guest flag are stored; access tokens are never persisted.
+
+Supplying an adapter only makes persistence possible. `Auth4Session.IsRefreshPersistent` (and
+`Auth4Client.IsRefreshPersistent` while signed in) is true only when the session's current refresh
+token was written successfully. If a write fails after sign-in or token rotation, the SDK deletes the
+stored value on a best-effort basis (so a stale token is not replayed after restart), the in-memory
+session keeps working, and the session reports `IsRefreshPersistent == false` through both
+`CurrentSession` and `SessionChanged`. The next successful write sets it back to true. Games that
+promise "stay signed in after restart", especially for guests, should check this flag. Storage
+exception details are not logged or exposed.
 
 ## Verification
 
