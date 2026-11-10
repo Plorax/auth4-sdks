@@ -1,0 +1,111 @@
+<!doctype html>
+<!--
+  Minimal Godot web export stand-in for AUTH4D-219. It installs the real Auth4WebBridge.SOURCE
+  (served as /auth4-web-bridge.js, taken from addons/auth4/auth4_web_bridge.gd) and plays the
+  GDScript side: callbacks stand in for JavaScriptBridge.create_callback, ready is answered with
+  the guest access token, and every event that crosses into "GDScript" is recorded. The test serves
+  /harness-config.js with the tenant, client, auth origin, redirect URI and guest token.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Godot web game</title>
+  </head>
+  <body>
+    <canvas id="canvas" width="480" height="240" aria-label="Game"></canvas>
+    <button id="sign-in" type="button">Sign in</button>
+    <button id="save" type="button">Save progress</button>
+    <p id="status" role="status"></p>
+    <script src="/harness-config.js"></script>
+    <script src="/auth4-web-bridge.js"></script>
+    <script type="module">
+      const { authOrigin, tenantId, clientId, redirectUri, guestToken } = window.harnessConfig;
+      const bridge = window.auth4GodotBridge;
+      const upgradeUrl = `${authOrigin}/login/upgrade?tenant_id=${tenantId}&client_id=${clientId}`;
+      const authorizeUrl = () =>
+        `${authOrigin}/oauth/authorize?` +
+        new URLSearchParams({
+          tenant_id: tenantId,
+          response_type: "code",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          scope: "openid offline_access",
+          state: "state-0123456789abcdefghijklmnopqrstuvwxyzABCDE",
+          code_challenge: "challenge-0123456789abcdefghijklmnopqrstuvwx",
+          code_challenge_method: "S256",
+        });
+      const status = document.getElementById("status");
+
+      window.events = [];
+      window.outcome = null;
+      let handle = 0;
+
+      const finish = (outcome, release) => {
+        window.outcome = outcome;
+        status.textContent = outcome.ok ? "Done" : `Failed: ${outcome.code}`;
+        if (release) bridge.release(handle);
+      };
+
+      // Auth4Client._on_sign_in_event / _on_upgrade_event, reached through Auth4WebBridge._dispatch.
+      const callback = (id, kind, data) => {
+        window.events.push({ handle: id, kind, data });
+        if (id !== handle) return;
+        switch (kind) {
+          case "opened":
+            status.textContent = "Window open";
+            return;
+          case "callback":
+            finish({ ok: true, query: data }, false);
+            return;
+          case "ready": {
+            const ready = JSON.parse(data);
+            if (ready.tenant_id !== tenantId || ready.client_id !== clientId) return;
+            bridge.sendToken(handle, guestToken);
+            return;
+          }
+          case "complete":
+            finish({ ok: true, result: JSON.parse(data) }, true);
+            return;
+          case "error":
+            // After identity_in_use the window may still link another credential.
+            if (data === "identity_in_use") finish({ ok: false, code: data }, false);
+            else if (data === "invalid_session") finish({ ok: false, code: data }, true);
+            return;
+          case "cancelled":
+            finish({ ok: false, code: "access_denied" }, true);
+            return;
+          case "blocked":
+            finish({ ok: false, code: "popup_blocked" }, false);
+            return;
+          case "closed":
+            finish({ ok: false, code: "window_closed" }, false);
+            return;
+          default:
+            return;
+        }
+      };
+
+      /** Auth4Client.sign_in_with_browser in a web export: Auth4WebBridge.open_sign_in_window. */
+      window.startSignIn = (url = authorizeUrl(), origin = authOrigin, redirect = redirectUri) => {
+        handle += 1;
+        return bridge.openSignIn(handle, url, origin, redirect, callback);
+      };
+      /** Auth4Client.upgrade_guest in a web export: Auth4WebBridge.open_upgrade_window. */
+      window.startUpgrade = (url = upgradeUrl, origin = authOrigin) => {
+        handle += 1;
+        return bridge.openUpgrade(handle, url, origin, callback);
+      };
+      /** The cancel token fired. */
+      window.cancelWindow = () => bridge.close(handle);
+
+      // Godot runs input handlers in its next main-loop iteration, after the browser event returned.
+      document.getElementById("sign-in").addEventListener("pointerdown", () => {
+        requestAnimationFrame(() => window.startSignIn());
+      });
+      document.getElementById("save").addEventListener("pointerdown", () => {
+        requestAnimationFrame(() => window.startUpgrade());
+      });
+      window.harnessReady = true;
+    </script>
+  </body>
+</html>

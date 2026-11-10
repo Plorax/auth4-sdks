@@ -9,3 +9,12 @@ dist/
 packages/sdk-unity/Tests~/**/bin/
 packages/sdk-unity/Tests~/**/obj/
 packages/sdk-unity/Tests~/**/TestResults/
+packages/sdk-dotnet/**/bin/
+packages/sdk-dotnet/**/obj/
+packages/sdk-dotnet/**/TestResults/
+packages/sdk-python/.venv/
+packages/sdk-python/**/*.egg-info/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

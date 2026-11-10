@@ -3,12 +3,22 @@
 The client and server SDKs for [auth4.dev](https://auth4.dev), authentication for games and web
 apps.
 
-| SDK     | Package               | Registry | Directory              | Documentation                                             |
-| ------- | --------------------- | -------- | ---------------------- | --------------------------------------------------------- |
-| Browser | `@auth4/sdk-browser`  | npm      | `packages/sdk-browser` | [auth4.dev/docs/browser](https://auth4.dev/docs/browser/) |
-| Server  | `@auth4/sdk-server`   | npm      | `packages/sdk-server`  | [auth4.dev/docs/server](https://auth4.dev/docs/server/)   |
-| Next.js | `@auth4/nextjs`       | npm      | `packages/sdk-nextjs`  | [auth4.dev/docs/nextjs](https://auth4.dev/docs/nextjs/)   |
-| Unity   | `dev.auth4.sdk` (UPM) | OpenUPM  | `packages/sdk-unity`   | [auth4.dev/docs/unity](https://auth4.dev/docs/unity/)     |
+| SDK     | Package                                        | Registry        | Directory              | Documentation                                             |
+| ------- | ---------------------------------------------- | --------------- | ---------------------- | --------------------------------------------------------- |
+| Browser | `@auth4/sdk-browser`                           | npm             | `packages/sdk-browser` | [auth4.dev/docs/browser](https://auth4.dev/docs/browser/) |
+| Server  | `@auth4/sdk-server`                            | npm             | `packages/sdk-server`  | [auth4.dev/docs/server](https://auth4.dev/docs/server/)   |
+| Next.js | `@auth4/nextjs`                                | npm             | `packages/sdk-nextjs`  | [auth4.dev/docs/nextjs](https://auth4.dev/docs/nextjs/)   |
+| Unity   | `dev.auth4.sdk` (UPM)                          | OpenUPM         | `packages/sdk-unity`   | [auth4.dev/docs/unity](https://auth4.dev/docs/unity/)     |
+| Unreal  | `Auth4` plugin                                 | Not yet         | `packages/sdk-unreal`  | [auth4.dev/docs/unreal](https://auth4.dev/docs/unreal/)   |
+| Godot   | `addons/auth4`                                 | Not yet         | `packages/sdk-godot`   | [auth4.dev/docs/godot](https://auth4.dev/docs/godot/)     |
+| .NET    | `Auth4.Server`, `Auth4.Server.AspNetCore`      | Not yet (NuGet) | `packages/sdk-dotnet`  | [auth4.dev/docs/dotnet](https://auth4.dev/docs/dotnet/)   |
+| Go      | `github.com/Plorax/auth4-sdks/packages/sdk-go` | Not yet tagged  | `packages/sdk-go`      | [auth4.dev/docs/go](https://auth4.dev/docs/go/)           |
+| Python  | `auth4`                                        | Not yet (PyPI)  | `packages/sdk-python`  | [auth4.dev/docs/python](https://auth4.dev/docs/python/)   |
+
+The Unreal, Godot, .NET, Go and Python SDKs are not published to a registry yet. Use them from a
+copy of this repository: see each directory's README. `node scripts/sdk/check.mjs` only checks
+their licence and version metadata; their own test suites need the engine or language toolchain
+(Unreal or CMake, Godot, .NET 8, Go, Python 3.10+).
 
 ## This repository is a read-only mirror
 
@@ -41,6 +51,10 @@ pnpm typecheck
 pnpm test
 node scripts/sdk/check.mjs          # builds, packs and checks every SDK as it would be published
 ```
+
+The other SDKs build with their own tools, for example `go vet ./...` and `go test ./...` in
+`packages/sdk-go`, `dotnet test packages/sdk-dotnet/tests/Auth4.Server.Tests` and `pytest` in
+`packages/sdk-python`.
 
 `packages/contracts` holds the wire shapes the server SDK shares with the service. It is not
 published on its own; the build inlines it into `@auth4/sdk-server`.

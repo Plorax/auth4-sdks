@@ -6,13 +6,27 @@
 //   node scripts/sdk/check.mjs --release <tag>         also gate one release tag (publish workflow)
 //
 // Release tags: sdk-browser/v<version>, sdk-server/v<version>, sdk-nextjs/v<version>,
-// dev.auth4.sdk/v<version> (Unity, the format OpenUPM expects with gitTagPrefix "dev.auth4.sdk/").
+// dev.auth4.sdk/v<version> (Unity, the format OpenUPM expects with gitTagPrefix "dev.auth4.sdk/"),
+// and the five source SDKs below (AUTH4D-479).
 // A release needs the tag version to match package.json and a final licence: "UNLICENSED" or the
 // placeholder Unity LICENSE.md fails.
+// AUTH4D-478: the Unreal, Godot, .NET, Go and Python SDKs have no package registry pipeline here; their
+// check only reads the directory, the MIT LICENSE and the version metadata, without engine or SDK
+// builds. AUTH4D-479: they are released as GitHub Release archives (scripts/sdk/archive.mjs) on tags
+// sdk-unreal/v<Auth4.uplugin VersionName>, sdk-godot/v<plugin.cfg version>, sdk-dotnet/v<csproj
+// Version>, sdk-python/v<pyproject version> and packages/sdk-go/v<x.y.z> (the Go module tag form; Go
+// has no version file, so the tag is the version).
 // Tarballs and sdk-check.json go to .generated/auth4d-151/. With GITHUB_OUTPUT set, a release run
 // also writes kind, name, version and tarball for the workflow.
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { gunzipSync } from "node:zlib";
@@ -45,6 +59,60 @@ const SDKS = [
     },
   },
   { kind: "unity", dir: "packages/sdk-unity", tagPrefix: "dev.auth4.sdk/v" },
+  // AUTH4D-478: version and licence metadata per ecosystem. AUTH4D-479: and the release tag.
+  {
+    kind: "source",
+    dir: "packages/sdk-unreal",
+    tagPrefix: "sdk-unreal/v",
+    name: "Auth4 (Unreal plugin)",
+    license: "LICENSE.md",
+    versions: [["Auth4.uplugin", /"VersionName":\s*"([^"]+)"/]],
+  },
+  {
+    kind: "source",
+    dir: "packages/sdk-godot",
+    tagPrefix: "sdk-godot/v",
+    name: "auth4 (Godot addon)",
+    versions: [["addons/auth4/plugin.cfg", /^version="([^"]+)"/m]],
+    licenses: [["addons/auth4/plugin.cfg", /^license="MIT"$/m]],
+  },
+  {
+    kind: "source",
+    dir: "packages/sdk-dotnet",
+    tagPrefix: "sdk-dotnet/v",
+    name: "Auth4.Server (.NET)",
+    versions: [
+      ["src/Auth4.Server/Auth4.Server.csproj", /<Version>([^<]+)<\/Version>/],
+      ["src/Auth4.Server.AspNetCore/Auth4.Server.AspNetCore.csproj", /<Version>([^<]+)<\/Version>/],
+    ],
+    licenses: [
+      ["src/Auth4.Server/Auth4.Server.csproj", /<PackageLicenseExpression>MIT</],
+      [
+        "src/Auth4.Server.AspNetCore/Auth4.Server.AspNetCore.csproj",
+        /<PackageLicenseExpression>MIT</,
+      ],
+    ],
+  },
+  {
+    kind: "source",
+    dir: "packages/sdk-go",
+    tagPrefix: "packages/sdk-go/v",
+    // No version file: the tag carries x.y.z, which must be a plain semantic version.
+    tagOnlyVersion: true,
+    name: "auth4 (Go module)",
+    // Go versions are tags; go.mod must name this repository's path or the mirror's.
+    versions: [
+      ["go.mod", /^module github\.com\/Plorax\/(?:auth4\.dev|auth4-sdks)\/packages\/sdk-go\r?\n/],
+    ],
+  },
+  {
+    kind: "source",
+    dir: "packages/sdk-python",
+    tagPrefix: "sdk-python/v",
+    name: "auth4 (Python)",
+    versions: [["pyproject.toml", /^version = "([^"]+)"/m]],
+    licenses: [["pyproject.toml", /^license = \{ text = "MIT" \}/m]],
+  },
 ];
 const ALLOWED_NPM_FILES =
   /^package\/(package\.json|README\.md|LICENSE(\.md|\.txt)?|dist\/.+\.(js|d\.ts))$/;
@@ -54,7 +122,9 @@ const args = process.argv.slice(2);
 const tagIndex = args.indexOf("--release");
 const tag = tagIndex >= 0 ? args[tagIndex + 1] : undefined;
 if (tagIndex >= 0 && !tag) usage("--release needs a tag");
-const release = tag ? SDKS.find((sdk) => tag.startsWith(sdk.tagPrefix)) : undefined;
+const release = tag
+  ? SDKS.find((sdk) => sdk.tagPrefix && tag.startsWith(sdk.tagPrefix))
+  : undefined;
 if (tag && !release) usage(`unknown release tag ${tag}`);
 
 rmSync(outDir, { recursive: true, force: true });
@@ -64,6 +134,8 @@ const report = { checkedAt: new Date().toISOString(), tag: tag ?? null, packages
 const errors = [];
 for (const sdk of release ? [release] : SDKS) {
   const entry = await checkSdk(sdk);
+  // AUTH4D-479: the tag that releases this version; Go has no version file, so the owner picks it.
+  entry.expectedTag = `${sdk.tagPrefix}${sdk.tagOnlyVersion && !tag ? "<x.y.z>" : entry.version}`;
   report.packages.push(entry);
   errors.push(...entry.errors.map((error) => `${entry.name}: ${error}`));
 }
@@ -74,7 +146,10 @@ if (errors.length > 0) {
   process.exit(1);
 }
 for (const entry of report.packages) {
-  console.log(`✓ ${entry.name}@${entry.version}: ${entry.files.length} files in ${entry.tarball}`);
+  const where = entry.tarball ? ` in ${entry.tarball}` : "";
+  console.log(
+    `✓ ${entry.name}@${entry.version}: ${entry.files.length} files${where}; tag ${entry.expectedTag}`,
+  );
 }
 if (release && process.env.GITHUB_OUTPUT) {
   const [entry] = report.packages;
@@ -82,13 +157,14 @@ if (release && process.env.GITHUB_OUTPUT) {
     `kind=${release.kind}`,
     `name=${entry.name}`,
     `version=${entry.version}`,
-    `tarball=${entry.tarball}`,
+    `tarball=${entry.tarball ?? ""}`,
   ];
   appendFileSync(process.env.GITHUB_OUTPUT, `${lines.join("\n")}\n`);
 }
 
 async function checkSdk(sdk) {
   const packageDir = join(repoRoot, sdk.dir);
+  if (sdk.kind === "source") return checkSourceSdk(sdk, packageDir);
   const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
   const errors = [];
   const fail = (message) => errors.push(message);
@@ -205,6 +281,52 @@ async function checkSdk(sdk) {
     tarball: relative(repoRoot, tarball).replaceAll("\\", "/"),
     files: [...files.keys()].map((path) => path.slice("package/".length)).sort(),
     dependencies: packedManifest.dependencies ?? {},
+    errors,
+  };
+}
+
+// AUTH4D-478: the directory, an MIT LICENSE and readable version metadata, nothing built.
+function checkSourceSdk(sdk, packageDir) {
+  const errors = [];
+  // The files the check read; build output and virtualenvs in the directory are not listed.
+  const files = new Set();
+  const read = (path) => {
+    const file = join(packageDir, path);
+    files.add(path);
+    if (existsSync(file)) return readFileSync(file, "utf8");
+    errors.push(`${path} is missing`);
+    return "";
+  };
+  if (!existsSync(packageDir)) errors.push(`${sdk.dir} is missing`);
+  const license = read(sdk.license ?? "LICENSE");
+  if (license && !license.startsWith("MIT License")) errors.push("the LICENSE is not MIT");
+  for (const [path, pattern] of sdk.licenses ?? []) {
+    if (!pattern.test(read(path))) errors.push(`${path} does not declare the MIT licence`);
+  }
+  const versions = new Set();
+  for (const [path, pattern] of sdk.versions) {
+    const match = pattern.exec(read(path));
+    if (!match) errors.push(`${path} has no version metadata`);
+    else if (match[1]) versions.add(match[1]);
+  }
+  if (versions.size > 1) errors.push(`versions disagree: ${[...versions].join(", ")}`);
+  let version = [...versions][0] ?? "untagged";
+  if (tag) {
+    const tagVersion = tag.slice(sdk.tagPrefix.length);
+    if (sdk.tagOnlyVersion) {
+      if (/^\d+\.\d+\.\d+$/.test(tagVersion)) version = tagVersion;
+      else errors.push(`tag version ${tagVersion} is not x.y.z`);
+    } else if (tagVersion !== version) {
+      errors.push(`tag version ${tagVersion} does not match the metadata version ${version}`);
+    }
+  }
+  return {
+    name: sdk.name,
+    version,
+    kind: sdk.kind,
+    tarball: null,
+    files: [...files].sort(),
+    dependencies: {},
     errors,
   };
 }

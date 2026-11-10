@@ -5,6 +5,13 @@
 #   sdk-nextjs/v<version>      -> npm @auth4/nextjs
 #   dev.auth4.sdk/v<version>   -> Unity: checked and packed only. OpenUPM builds from the tag itself
 #                                 (gitTagPrefix "dev.auth4.sdk/"); the Asset Store upload is manual.
+#                                 The "release" job also attaches the UPM .tgz to a GitHub Release.
+#   sdk-unreal/v<version>      -> GitHub Release with the plugin zip (AUTH4D-479)
+#   sdk-godot/v<version>       -> GitHub Release with the addon zip
+#   sdk-dotnet/v<version>      -> GitHub Release with the source zip
+#   sdk-python/v<version>      -> GitHub Release with the source zip
+#   packages/sdk-go/v<x.y.z>   -> GitHub Release with the source zip (the tag is also the Go module
+#                                 version, so go get github.com/Plorax/auth4-sdks/packages/sdk-go works)
 #
 # This repository is the read-only mirror of the SDKs (README.md). Only the mirror's deploy key can
 # update main or create these tags; the source repository's CI has already passed for the commit.
@@ -18,6 +25,10 @@
 # of a package, before trusted publishing can be configured for it) is that token used instead. That
 # token is stage-only, so the version is staged and goes live only after approval on npmjs.com.
 # Every publish carries npm provenance.
+# Release (AUTH4D-479): the Unity, Unreal, Godot, .NET, Python and Go tags create a GitHub Release on
+# this repository with the archive from scripts/sdk/archive.mjs (git archive of the tagged commit,
+# allowlisted and byte-identical on every run) and the CHANGELOG section for the version as notes.
+# It is the only job with contents: write, and it runs no code from the archive.
 name: Publish SDKs
 
 on:
@@ -27,6 +38,11 @@ on:
       - "sdk-server/v*"
       - "sdk-nextjs/v*"
       - "dev.auth4.sdk/v*"
+      - "sdk-unreal/v*"
+      - "sdk-godot/v*"
+      - "sdk-dotnet/v*"
+      - "sdk-python/v*"
+      - "packages/sdk-go/v*"
 
 permissions:
   contents: read
@@ -134,6 +150,55 @@ jobs:
             echo "Publishing with npm trusted publishing (OIDC)."
             npm publish "$TARBALL" --provenance --access public
           fi
+
+  release:
+    name: GitHub Release
+    needs: gate
+    if: needs.gate.outputs.kind != 'npm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      SHA: ${{ github.sha }}
+      GH_TOKEN: ${{ github.token }}
+      TARBALL: ${{ needs.gate.outputs.tarball }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      # The Unity tarball is the file the gate checked; the other archives are built from the commit.
+      - name: Download the checked package
+        if: needs.gate.outputs.kind == 'unity'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdk-package
+          path: .generated/auth4d-151
+      # archive.mjs prints the one archive it wrote; the notes are next to it.
+      - name: Build the archive
+        id: archive
+        run: |
+          args=(--tag "$TAG" --out "$RUNNER_TEMP/release")
+          if [ -n "$TARBALL" ]; then args+=(--unity-tarball "$TARBALL"); fi
+          # Captured on its own line so a failure of archive.mjs fails the step.
+          file=$(node scripts/sdk/archive.mjs "${args[@]}")
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+      # A published release is never replaced: tags are never moved, and neither are their archives.
+      - name: Create the release
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.file }}
+        run: |
+          [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ] || { echo "No archive was built for $TAG." >&2; exit 1; }
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already has a release; releases are never replaced." >&2
+            exit 1
+          fi
+          gh release create "$TAG" "$ARCHIVE" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/release/release-notes.md"
 
   unity:
     name: Unity package summary

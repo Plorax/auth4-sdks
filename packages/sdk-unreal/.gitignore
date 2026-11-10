@@ -1,0 +1,3 @@
+# Unreal build output when the plugin sits inside a project
+Binaries/
+Intermediate/

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    AUTH4D-169 C#/.NET server SDK: verifies auth4.dev access tokens for game backends. net8.0 for
+    ASP.NET Core and console hosts; netstandard2.1 for Unity dedicated servers.
+  -->
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;netstandard2.1</TargetFrameworks>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RootNamespace>Auth4.Server</RootNamespace>
+    <PackageId>Auth4.Server</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>auth4.dev</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Description>Verify auth4.dev access tokens in .NET game backends and Unity dedicated servers.</Description>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.1'">
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Auth4.Server.Tests" />
+  </ItemGroup>
+</Project>

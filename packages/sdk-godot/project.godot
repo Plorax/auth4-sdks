@@ -1,0 +1,13 @@
+; Headless test project for the auth4.dev Godot addon (AUTH4D-152). Run it through
+; packages/sdk-godot/tests/run.mjs, which starts the local mock server first.
+
+config_version=5
+
+[application]
+
+config/name="auth4.dev Godot SDK tests"
+config/features=PackedStringArray("4.3")
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/auth4/plugin.cfg")

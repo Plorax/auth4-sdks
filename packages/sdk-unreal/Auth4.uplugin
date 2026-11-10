@@ -1,0 +1,27 @@
+{
+  "FileVersion": 3,
+  "Version": 2,
+  "VersionName": "0.2.0",
+  "FriendlyName": "auth4.dev Authentication",
+  "Description": "Game authentication for auth4.dev: device sign-in, guest sessions with upgrades by email, Discord or Steam in the system browser, and rotating refresh tokens kept in memory unless a secure storage adapter is supplied.",
+  "Category": "Online",
+  "CreatedBy": "auth4.dev",
+  "CreatedByURL": "https://auth4.dev",
+  "DocsURL": "https://auth4.dev/docs/unreal/",
+  "SupportURL": "https://auth4.dev/docs/unreal/",
+  "CanContainContent": false,
+  "IsBetaVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "Auth4Core",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "Auth4",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ]
+}
